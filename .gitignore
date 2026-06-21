@@ -1,0 +1,25 @@
+# Large / downloaded / derived artifacts (reproducible; not source)
+# - downloads/ : official installer (windhawk_setup_offline.exe, ~149 MB)
+# - windhawk-portable/ : extracted runtime + locally-built binaries (test rig)
+# - tools/ : fetched helpers (nuget.exe)
+/downloads/
+/windhawk-portable/
+/tools/
+
+# Upstream Windhawk clone.
+# Reproducible via `git clone https://github.com/ramensoftware/windhawk` (see CLAUDE.md).
+# Will be vendored/submoduled here once we modify the fork's native source.
+/windhawk/
+
+# .NET build outputs
+[Bb]in/
+[Oo]bj/
+*.user
+
+# Ad-hoc / machine-specific profile exports (the reviewed profile is committed explicitly)
+*.local.json
+
+# OS / editor cruft
+Thumbs.db
+desktop.ini
+.vs/
