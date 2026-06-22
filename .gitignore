@@ -43,3 +43,6 @@ desktop.ini
 /certs/
 /docs/fleet-cert-trust.md
 /scripts/fleet-trust-cert.ps1
+
+# Generated embedded payload for the single-file installer
+/whsetup/payload.zip

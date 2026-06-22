@@ -40,6 +40,8 @@ static int Run(string[] args)
         "list" => CmdList(rest),
         "install" => CmdInstall(rest),
         "update" => CmdUpdate(rest),
+        "self-update" => CmdSelfUpdate(rest),
+        "auto-update" => CmdAutoUpdate(rest),
         "uninstall" or "remove" => CmdUninstall(rest),
         "enable" => CmdEnableDisable(rest, true),
         "disable" => CmdEnableDisable(rest, false),
@@ -116,8 +118,7 @@ static int CmdApply(string[] a)
 
     var install = ResolveTarget(Opt(a, "--root"));
     var store = install.OpenStore();
-    var sources = new SourceProvider(ResolveBundle(Opt(a, "--bundle")), allowFetch: !Flag(a, "--no-fetch"));
-    var compiler = new ModCompiler(install, Arm64Enabled(a));
+    bool arm64 = Arm64Enabled(a);
     bool applyApp = Flag(a, "--app-settings");
 
     Console.WriteLine($"Applying {profile.Mods.Count} mods to {install.RootPath}");
@@ -126,7 +127,7 @@ static int CmdApply(string[] a)
     {
         try
         {
-            InstallMod(install, store, sources, compiler, m.Id, m.Version, m.Disabled, m.Settings);
+            InstallMod(install, store, m.Id, m.Version, m.Disabled, m.Settings, arm64);
             Console.WriteLine($"  ok  {m.Id} v{m.Version} ({(m.Disabled ? "disabled" : "enabled")}, {m.Settings.Count} settings)");
             ok++;
         }
@@ -162,25 +163,24 @@ static int CmdInstall(string[] a)
 
     var install = ResolveTarget(Opt(a, "--root"));
     var store = install.OpenStore();
-    var sources = new SourceProvider(ResolveBundle(Opt(a, "--bundle")), allowFetch: !Flag(a, "--no-fetch"));
-    var compiler = new ModCompiler(install, Arm64Enabled(a));
 
     // No explicit settings -> the mod uses the defaults declared in its source.
-    InstallMod(install, store, sources, compiler, id, Opt(a, "--version"), Flag(a, "--disabled"), settings: null);
+    InstallMod(install, store, id, Opt(a, "--version") ?? "", Flag(a, "--disabled"), settings: null, Arm64Enabled(a));
     Console.WriteLine($"Installed {id}.");
     return 0;
 }
 
-/// <summary>Shared install/apply core: source -> compile -> config -> settings -> source cache.</summary>
-static void InstallMod(WindhawkInstall install, IModStore store, SourceProvider sources, ModCompiler compiler,
-                       string id, string? pinnedVersion, bool disabled, IReadOnlyDictionary<string, SettingValue>? settings)
+/// <summary>Shared install/apply core: metadata -> download precompiled DLLs -> config -> settings.</summary>
+static void InstallMod(WindhawkInstall install, IModStore store, string id, string version, bool disabled,
+                       IReadOnlyDictionary<string, SettingValue>? settings, bool arm64)
 {
-    var (source, _) = sources.Get(id, pinnedVersion);
+    if (string.IsNullOrEmpty(version)) version = PrecompiledMods.LatestVersion(id);
+    string source = PrecompiledMods.GetSource(id, version);
     var meta = ModMetadata.Parse(source);
     if (meta.Id != id)
         throw new InvalidOperationException($"source @id '{meta.Id}' does not match '{id}'");
 
-    string dll = compiler.CompileMod(id, meta.Version, meta.Include, source, meta.Architecture, meta.CompilerOptions);
+    string dll = PrecompiledMods.Download(install.EngineModsPath, id, meta.Version, meta.Architecture, arm64);
 
     store.SetModConfig(id, new ModConfig
     {
@@ -195,12 +195,12 @@ static void InstallMod(WindhawkInstall install, IModStore store, SourceProvider 
     if (settings is not null)
         store.SetModSettings(id, settings);
 
-    // Cache the source so the UI can display/recompile the mod.
+    // Cache the source for reference (and a possible future local-compile mode).
     Directory.CreateDirectory(install.ModsSourcePath);
     File.WriteAllText(Path.Combine(install.ModsSourcePath, id + ".wh.cpp"), source);
 
-    // Drop stale builds from previous installs so the mods folder stays clean.
-    compiler.CleanupOldFiles(id, meta.Architecture, dll);
+    // Drop stale DLLs from previous installs.
+    ModFiles.DeleteOld(install.EngineModsPath, id, ModFiles.SubfoldersFor(meta.Architecture, arm64), dll);
 }
 
 // ---------------------------------------------------------------- update
@@ -230,13 +230,13 @@ static int CmdUpdate(string[] a)
         Console.WriteLine($"  {o.id}  {o.from} -> {o.to}" + (o.enabled ? "" : " (disabled)"));
     if (dryRun) return 0;
 
-    var compiler = new ModCompiler(install, Arm64Enabled(a));
+    bool arm64 = Arm64Enabled(a);
     int ok = 0, fail = 0;
     foreach (var o in outdated)
     {
         try
         {
-            UpdateOne(install, store, compiler, o.id, o.enabled, noReload);
+            UpdateOne(install, store, o.id, o.to, o.enabled, noReload, arm64);
             Console.WriteLine($"  updated {o.id} -> {o.to}");
             ok++;
         }
@@ -246,9 +246,9 @@ static int CmdUpdate(string[] a)
     return fail == 0 ? 0 : 1;
 }
 
-/// <summary>Update one mod, optionally doing the disable -> swap -> enable dance for a live engine.</summary>
-static void UpdateOne(WindhawkInstall install, IModStore store, ModCompiler compiler,
-                      string id, bool enabled, bool noReload)
+/// <summary>Update one mod to a version, doing the disable -> swap -> enable dance for a live engine.</summary>
+static void UpdateOne(WindhawkInstall install, IModStore store,
+                      string id, string version, bool enabled, bool noReload, bool arm64)
 {
     bool dance = enabled && !noReload;
     if (dance)
@@ -259,40 +259,14 @@ static void UpdateOne(WindhawkInstall install, IModStore store, ModCompiler comp
 
     try
     {
-        string source = FetchLatestSource(id);
-        var meta = ModMetadata.Parse(source);
-        if (meta.Id != id)
-            throw new InvalidOperationException($"source @id '{meta.Id}' != '{id}'");
-
-        string dll = compiler.CompileMod(id, meta.Version, meta.Include, source, meta.Architecture, meta.CompilerOptions);
-        store.SetModConfig(id, new ModConfig
-        {
-            LibraryFileName = dll,
-            Disabled = dance ? true : !enabled, // keep disabled during the swap when dancing
-            Include = meta.Include,
-            Exclude = meta.Exclude,
-            Architecture = meta.Architecture,
-            Version = meta.Version,
-        });
-        // Settings are intentionally preserved (not touched) across an update.
-        Directory.CreateDirectory(install.ModsSourcePath);
-        File.WriteAllText(Path.Combine(install.ModsSourcePath, id + ".wh.cpp"), source);
-        compiler.CleanupOldFiles(id, meta.Architecture, dll);
+        // settings = null preserves existing per-mod settings across the update.
+        InstallMod(install, store, id, version, disabled: !enabled, settings: null, arm64);
     }
     finally
     {
-        // Restore the original enabled state. For a live update this is the "enable after"
-        // step that makes the engine load the new DLL; on failure it restores the old version.
-        store.EnableMod(id, enabled);
+        store.EnableMod(id, enabled); // "enable after" -> engine loads the new DLL
         if (dance) System.Threading.Thread.Sleep(150);
     }
-}
-
-static string FetchLatestSource(string id)
-{
-    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
-    http.DefaultRequestHeaders.UserAgent.ParseAdd("whcli");
-    return http.GetStringAsync($"https://mods.windhawk.net/mods/{id}.wh.cpp").GetAwaiter().GetResult();
 }
 
 static Dictionary<string, string> FetchCatalogVersions()
@@ -382,6 +356,93 @@ static int CmdSetSetting(string[] a)
     return 0;
 }
 
+// ---------------------------------------------------------------- self-update / auto-update
+static int CmdSelfUpdate(string[] a)
+{
+    var install = ResolveTarget(Opt(a, "--root"));
+    bool dryRun = Flag(a, "--dry-run");
+    string repo = Opt(a, "--repo") ?? Fork.Repo;
+
+    var settings = AppConfig.ReadSection(install, "Settings");
+    string installed = settings.TryGetValue("ForkVersion", out var fv) ? fv.ToString() : "0.0.0";
+
+    try
+    {
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+        http.DefaultRequestHeaders.UserAgent.ParseAdd("whcli");
+        var json = http.GetStringAsync($"https://api.github.com/repos/{repo}/releases/latest").GetAwaiter().GetResult();
+        using var doc = JsonDocument.Parse(json);
+        string latest = (doc.RootElement.TryGetProperty("tag_name", out var t) ? t.GetString() ?? "" : "").TrimStart('v', 'V');
+
+        string? exeUrl = null;
+        if (doc.RootElement.TryGetProperty("assets", out var assets))
+            foreach (var asset in assets.EnumerateArray())
+                if ((asset.GetProperty("name").GetString() ?? "").EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                { exeUrl = asset.GetProperty("browser_download_url").GetString(); break; }
+
+        if (string.IsNullOrEmpty(latest) || CompareVersions(latest, installed) <= 0)
+        {
+            Console.WriteLine($"App up to date (installed {installed}, latest {(latest.Length > 0 ? latest : "?")}).");
+            return 0;
+        }
+        Console.WriteLine($"App update available: {installed} -> {latest}");
+        if (dryRun) return 0;
+        if (exeUrl is null) { Console.Error.WriteLine("  no installer .exe asset in latest release; deferring."); return 0; }
+
+        return DoSelfUpdate(install, exeUrl, latest, settings);
+    }
+    catch (Exception e)
+    {
+        Console.Error.WriteLine($"  self-update check failed ({e.Message}); deferring.");
+        return 0;
+    }
+}
+
+static int DoSelfUpdate(WindhawkInstall install, string exeUrl, string version, Dictionary<string, SettingValue> settings)
+{
+    string work = Path.Combine(Path.GetTempPath(), "whxyz-update-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(work);
+    string setupExe = Path.Combine(work, "whsetup.exe");
+
+    Console.WriteLine("  downloading update...");
+    using (var http = new HttpClient { Timeout = TimeSpan.FromMinutes(15) })
+    {
+        http.DefaultRequestHeaders.UserAgent.ParseAdd("whcli");
+        using var resp = http.GetAsync(exeUrl, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
+        resp.EnsureSuccessStatusCode();
+        using var fs = File.Create(setupExe);
+        resp.Content.CopyToAsync(fs).GetAwaiter().GetResult();
+    }
+
+    // The installer is a single self-contained, signed file — verifying it covers the
+    // whole embedded payload. Refuse anything not validly signed by our cert.
+    if (!Signature.IsSignedBy(setupExe, Fork.SigningCertThumbprint))
+    {
+        Console.Error.WriteLine("  update is not validly signed by the expected certificate; deferring.");
+        try { Directory.Delete(work, true); } catch { }
+        return 0;
+    }
+
+    // Launch the new installer detached, preserving the current configuration.
+    var args = new List<string> { "--silent", "--install-dir", install.RootPath, "--add-defender-exclusion" };
+    if (settings.TryGetValue("AutomaticUpdates", out var au) && au.IsInt && au.Int != 0) args.Add("--auto-updates");
+    if (settings.TryGetValue("HideTrayIcon", out var ht) && ht.IsInt && ht.Int != 0) args.Add("--no-system-tray");
+
+    var psi = new System.Diagnostics.ProcessStartInfo(setupExe) { UseShellExecute = false, CreateNoWindow = true };
+    foreach (var x in args) psi.ArgumentList.Add(x);
+    System.Diagnostics.Process.Start(psi);
+    Console.WriteLine($"  launched installer for {version}; the service will be replaced and restarted.");
+    return 10; // signal: update launched
+}
+
+/// <summary>Self-update first; if no app update was launched, update mods.</summary>
+static int CmdAutoUpdate(string[] a)
+{
+    int rc = CmdSelfUpdate(a);
+    if (rc == 10) return 10; // app update launched -> the new version will update mods on startup
+    return CmdUpdate(a);
+}
+
 // ---------------------------------------------------------------- tray (runtime show/hide)
 static int CmdTray(string[] a)
 {
@@ -428,12 +489,11 @@ static int CmdStatus(string[] a)
     bool ok = true;
     void Check(bool pass, string label) { Console.WriteLine($"[{(pass ? "x" : " ")}] {label}"); ok &= pass; }
 
-    // Compiler present (required to install/compile mods).
-    var clang = Path.Combine(install.CompilerPath, "bin", "clang++.exe");
-    Check(File.Exists(clang), $"compiler: {clang}");
+    // Engine present.
+    Check(File.Exists(Path.Combine(install.EnginePath, "64", "windhawk.dll")), $"engine: {install.EnginePath}");
 
-    // Engine import lib present for at least the 64-bit target.
-    Check(File.Exists(Path.Combine(install.EnginePath, "64", "windhawk.lib")), $"engine libs: {install.EnginePath}");
+    // Mod runtime libs present (precompiled mods link against these at load time).
+    Check(File.Exists(Path.Combine(install.EngineModsPath, "64", "libc++.whl")), $"runtime libs: {install.EngineModsPath}\\64");
 
     // Storage writable.
     bool storageOk;
@@ -444,7 +504,7 @@ static int CmdStatus(string[] a)
     // Service running (non-portable only).
     if (!install.Portable)
     {
-        string svc = Opt(a, "--service") ?? "Windhawk";
+        string svc = Opt(a, "--service") ?? "WindhawkCLI";
         string state = ServiceQuery.State(svc);
         Check(state == "running", $"service '{svc}': {state}");
     }
@@ -562,6 +622,8 @@ static void PrintHelp()
           list
           install <id> [--version v] [--disabled] [--no-fetch] [--arm64]
           update [--dry-run] [--no-reload]   Upgrade outdated mods to catalog latest
+          self-update [--dry-run]            Update the app itself (signed) from the release feed
+          auto-update                        self-update if available, otherwise update mods
           uninstall <id>
           enable <id>
           disable <id>
@@ -578,4 +640,11 @@ static void PrintHelp()
           * Sources resolve from --bundle (or $WHCLI_BUNDLE, default ./mods); fetch from
             windhawk-mods is a fallback unless --no-fetch.
         """);
+}
+
+// Fork identity constants (used by self-update).
+static class Fork
+{
+    public const string Repo = "hansonxyz/windhawk-cli";
+    public const string SigningCertThumbprint = "94041D722C6A606BE3752408FED5693100A8047C";
 }

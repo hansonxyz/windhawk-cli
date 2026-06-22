@@ -1,5 +1,5 @@
 diff --git a/src/windhawk/app/app.cpp b/src/windhawk/app/app.cpp
-index 3941a75..bafbf98 100644
+index 3941a75..f30fed2 100644
 --- a/src/windhawk/app/app.cpp
 +++ b/src/windhawk/app/app.cpp
 @@ -281,7 +281,7 @@ void RunDaemon() {
@@ -7,7 +7,7 @@ index 3941a75..bafbf98 100644
  
      wil::unique_mutex_nothrow mutex(
 -        ::CreateMutex(nullptr, TRUE, L"WindhawkDaemon"));
-+        ::CreateMutex(nullptr, TRUE, L"WindhawkXYZDaemon"));
++        ::CreateMutex(nullptr, TRUE, L"WindhawkCLIDaemon"));
      THROW_LAST_ERROR_IF_NULL(mutex);
  
      if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -34,19 +34,19 @@ index 3941a75..bafbf98 100644
  void NotifyNewUpdatesFound() {
      SetNamedEventForAllSessions(
 -        L"Global\\WindhawkNewUpdatesFoundEvent-daemon-session=");
-+        L"Global\\WindhawkXYZNewUpdatesFoundEvent-daemon-session=");
++        L"Global\\WindhawkCLINewUpdatesFoundEvent-daemon-session=");
  }
  
  void NotifyAppSettingsChanged() {
      if (StorageManager::GetInstance().IsPortable()) {
 -        SetNamedEvent(L"WindhawkAppSettingsChangedEvent-daemon");
-+        SetNamedEvent(L"WindhawkXYZAppSettingsChangedEvent-daemon");
++        SetNamedEvent(L"WindhawkCLIAppSettingsChangedEvent-daemon");
          return;
      }
  
      SetNamedEventForAllSessions(
 -        L"Global\\WindhawkAppSettingsChangedEvent-daemon-session=");
-+        L"Global\\WindhawkXYZAppSettingsChangedEvent-daemon-session=");
++        L"Global\\WindhawkCLIAppSettingsChangedEvent-daemon-session=");
  }
  
  void ExitApp(bool wait, DWORD timeout) {
@@ -55,12 +55,12 @@ index 3941a75..bafbf98 100644
  bool PostCommandToPortableRunningDaemon(
      CMainWindow::PortableAppCommand command) {
 -    CWindow hDaemonWnd(FindWindow(L"WindhawkDaemon", nullptr));
-+    CWindow hDaemonWnd(FindWindow(L"WindhawkXYZDaemon", nullptr));
++    CWindow hDaemonWnd(FindWindow(L"WindhawkCLIDaemon", nullptr));
      if (!hDaemonWnd) {
          return false;
      }
 diff --git a/src/windhawk/app/functions.cpp b/src/windhawk/app/functions.cpp
-index 8de915c..d801f22 100644
+index 8de915c..8c2061a 100644
 --- a/src/windhawk/app/functions.cpp
 +++ b/src/windhawk/app/functions.cpp
 @@ -2,6 +2,8 @@
@@ -72,7 +72,7 @@ index 8de915c..d801f22 100644
  namespace Functions {
  
  namespace {
-@@ -615,4 +617,58 @@ void ApplyDialogLayoutRtl(CWindow wnd, bool isLayoutRtl) {
+@@ -615,4 +617,60 @@ void ApplyDialogLayoutRtl(CWindow wnd, bool isLayoutRtl) {
      wnd.InvalidateRect(NULL);
  }
  
@@ -100,7 +100,9 @@ index 8de915c..d801f22 100644
 +        return;
 +    }
 +
-+    std::wstring cmdLine = L"\"" + whcli + L"\" update --root \"" + dir + L"\"";
++    // "auto-update" = self-update the app first (if a newer signed release exists),
++    // otherwise update mods. --no-reload is passed through to the mod-update step.
++    std::wstring cmdLine = L"\"" + whcli + L"\" auto-update --root \"" + dir + L"\"";
 +    if (noReload) {
 +        cmdLine += L" --no-reload";
 +    }
@@ -147,7 +149,7 @@ index f0f9ffb..a28188f 100644
 +
  }  // namespace Functions
 diff --git a/src/windhawk/app/main_window.cpp b/src/windhawk/app/main_window.cpp
-index 8aa2a60..b0ed23b 100644
+index 8aa2a60..6b44bb1 100644
 --- a/src/windhawk/app/main_window.cpp
 +++ b/src/windhawk/app/main_window.cpp
 @@ -1,5 +1,7 @@
@@ -192,7 +194,43 @@ index 8aa2a60..b0ed23b 100644
          case Timer::kUpdateCheck:
              KillTimer(Timer::kUpdateCheck);
  
-@@ -539,8 +561,13 @@ void CMainWindow::InitForPortableVersion() {
+@@ -398,17 +420,10 @@ LRESULT CMainWindow::OnTrayIcon(UINT uMsg, WPARAM wParam, LPARAM lParam) {
+             return Action::kNone;
+         }
+ 
+-        menu.AppendMenu(MF_STRING, static_cast<UINT_PTR>(Action::kOpenUI),
+-                        Functions::LoadStrFromRsrc(IDS_TRAY_OPEN));
+-        menu.AppendMenu(MF_SEPARATOR);
++        // windhawk-cli has no GUI: the tray shows the native loaded-mods status and exit.
+         menu.AppendMenu(MF_STRING,
+                         static_cast<UINT_PTR>(Action::kModTaskManager),
+                         Functions::LoadStrFromRsrc(IDS_TRAY_LOADED_MODS));
+-        menu.AppendMenu(
+-            MF_STRING, static_cast<UINT_PTR>(Action::kToolkit),
+-            (std::wstring(Functions::LoadStrFromRsrc(IDS_TRAY_TOOLKIT)) +
+-             (m_disableToolkitHotkey ? L"" : L"\tCtrl+Win+W"))
+-                .c_str());
+         menu.AppendMenu(MF_SEPARATOR);
+         menu.AppendMenu(MF_STRING, static_cast<UINT_PTR>(Action::kExit),
+                         Functions::LoadStrFromRsrc(IDS_TRAY_EXIT));
+@@ -426,14 +441,14 @@ LRESULT CMainWindow::OnTrayIcon(UINT uMsg, WPARAM wParam, LPARAM lParam) {
+ 
+     switch (m_trayIcon->HandleMsg(wParam, lParam)) {
+         case AppTrayIcon::TrayAction::kDefault:
+-            action = Action::kOpenUI;
++            action = Action::kModTaskManager;  // no GUI: show native status instead
+             break;
+ 
+         case AppTrayIcon::TrayAction::kBalloon:
+             if (m_lastUpdateStatus && m_lastUpdateStatus->appUpdateAvailable) {
+                 action = Action::kOpenUpdatePage;
+             } else {
+-                action = Action::kOpenUI;
++                action = Action::kModTaskManager;  // no GUI: show native status instead
+             }
+             break;
+ 
+@@ -539,8 +554,13 @@ void CMainWindow::InitForPortableVersion() {
  
      SetTimer(Timer::kHandleNewProcesses, kHandleNewProcessInterval);
  
@@ -203,16 +241,16 @@ index 8aa2a60..b0ed23b 100644
 +
      m_appSettingsChangedEvent.reset(Functions::CreateEventForMediumIntegrity(
 -        L"WindhawkAppSettingsChangedEvent-daemon"));
-+        L"WindhawkXYZAppSettingsChangedEvent-daemon"));
++        L"WindhawkCLIAppSettingsChangedEvent-daemon"));
  
      FILETIME creationTime;
      FILETIME exitTime;
-@@ -568,14 +595,14 @@ void CMainWindow::InitForNonPortableVersion() {
+@@ -568,14 +588,14 @@ void CMainWindow::InitForNonPortableVersion() {
          ProcessIdToSessionId(GetCurrentProcessId(), &sessionId));
  
      std::wstring appSettingsChangedEventName =
 -        L"Global\\WindhawkAppSettingsChangedEvent-daemon-session=" +
-+        L"Global\\WindhawkXYZAppSettingsChangedEvent-daemon-session=" +
++        L"Global\\WindhawkCLIAppSettingsChangedEvent-daemon-session=" +
          std::to_wstring(sessionId);
  
      m_appSettingsChangedEvent.reset(Functions::CreateEventForMediumIntegrity(
@@ -220,12 +258,12 @@ index 8aa2a60..b0ed23b 100644
  
      std::wstring newUpdatesFoundEventName =
 -        L"Global\\WindhawkNewUpdatesFoundEvent-daemon-session=" +
-+        L"Global\\WindhawkXYZNewUpdatesFoundEvent-daemon-session=" +
++        L"Global\\WindhawkCLINewUpdatesFoundEvent-daemon-session=" +
          std::to_wstring(sessionId);
  
      m_newUpdatesFoundEvent.reset(Functions::CreateEventForMediumIntegrity(
 diff --git a/src/windhawk/app/main_window.h b/src/windhawk/app/main_window.h
-index a62cec7..c749803 100644
+index a62cec7..b6727e7 100644
 --- a/src/windhawk/app/main_window.h
 +++ b/src/windhawk/app/main_window.h
 @@ -14,7 +14,7 @@ class CMainWindow : public CWindowImpl<CMainWindow, CWindow, CNullTraits>,
@@ -233,7 +271,7 @@ index a62cec7..c749803 100644
                      public CIdleHandler {
     public:
 -    DECLARE_WND_CLASS(L"WindhawkDaemon")
-+    DECLARE_WND_CLASS(L"WindhawkXYZDaemon")
++    DECLARE_WND_CLASS(L"WindhawkCLIDaemon")
  
      // Custom messages.
      enum {
@@ -273,7 +311,7 @@ index 5d0e2d4..c154e76 100644
          m_engineControl->HandleNewProcesses();
      }
 diff --git a/src/windhawk/app/service_common.h b/src/windhawk/app/service_common.h
-index 528baff..030b52f 100644
+index 528baff..1056a2e 100644
 --- a/src/windhawk/app/service_common.h
 +++ b/src/windhawk/app/service_common.h
 @@ -2,21 +2,23 @@
@@ -281,28 +319,28 @@ index 528baff..030b52f 100644
  namespace ServiceCommon {
  
 -static inline constexpr WCHAR kName[] = L"Windhawk";
-+// Fork identity (WindhawkXYZ) — distinct from the upstream "Windhawk" so the
++// Fork identity (WindhawkCLI) — distinct from the upstream "Windhawk" so the
 +// service and its kernel objects don't collide with an official install.
-+static inline constexpr WCHAR kName[] = L"WindhawkXYZ";
++static inline constexpr WCHAR kName[] = L"WindhawkCLI";
  
  static inline constexpr WCHAR kInfoFileMappingName[] =
 -    L"Global\\WindhawkServiceInfoFileMapping";
-+    L"Global\\WindhawkXYZServiceInfoFileMapping";
++    L"Global\\WindhawkCLIServiceInfoFileMapping";
  
 -static inline constexpr WCHAR kMutexName[] = L"Global\\WindhawkServiceMutex";
-+static inline constexpr WCHAR kMutexName[] = L"Global\\WindhawkXYZServiceMutex";
++static inline constexpr WCHAR kMutexName[] = L"Global\\WindhawkCLIServiceMutex";
  
  static inline constexpr WCHAR kScanForProcessesEventName[] =
 -    L"Global\\WindhawkScanForProcesses";
-+    L"Global\\WindhawkXYZScanForProcesses";
++    L"Global\\WindhawkCLIScanForProcesses";
  
  static inline constexpr WCHAR kEmergencyStopEventName[] =
 -    L"Global\\WindhawkServiceEmergencyStopEvent";
-+    L"Global\\WindhawkXYZServiceEmergencyStopEvent";
++    L"Global\\WindhawkCLIServiceEmergencyStopEvent";
  
  static inline constexpr WCHAR kSafeModeStopEventName[] =
 -    L"Global\\WindhawkServiceSafeModeStopEvent";
-+    L"Global\\WindhawkXYZServiceSafeModeStopEvent";
++    L"Global\\WindhawkCLIServiceSafeModeStopEvent";
  
  struct ServiceInfo {
      DWORD version;

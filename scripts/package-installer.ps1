@@ -1,64 +1,85 @@
 <#
 .SYNOPSIS
-  Assemble the offline installer package: dist\installer\{whsetup.exe, payload\}.
+  Build the single, self-contained, signed windhawk-cli installer.
 .DESCRIPTION
-  payload\ = the runtime (Compiler/Engine/UI + helper DLLs) from windhawk-portable,
-  with the freshly-built rebranded windhawk.exe and whcli.exe overlaid, and the
-  per-install AppData\ + windhawk.ini excluded (the installer writes windhawk.ini
-  and the engine creates AppData at runtime).
+  Produces ONE file — dist\windhawk-cli-<version>-installer.exe — a self-extracting,
+  self-installing whsetup.exe with the entire runtime payload embedded. Signing that one
+  file therefore covers the whole installer + payload (tamper-evident as a unit).
 
-  Prereqs: build the rebranded app (Release\windhawk.exe), whcli (dist\whcli.exe),
-  and whsetup (dist\whsetup.exe) first (this script copies, it doesn't build them).
+  Steps: assemble payload (rebranded windhawk.exe + whcli.exe over the portable runtime),
+  sign the payload binaries, zip + embed them into whsetup, build whsetup, sign whsetup.
+
+  Prereqs (build these first): Release\windhawk.exe (app) and dist\whcli.exe.
 #>
 [CmdletBinding()]
-param([switch]$NoSign)
+param([string]$Version = '1.0.0', [switch]$NoSign)
 
 $ErrorActionPreference = 'Stop'
-$Repo  = Split-Path -Parent $PSScriptRoot
-$port  = Join-Path $Repo 'windhawk-portable'
+$Repo   = Split-Path -Parent $PSScriptRoot
+$port   = Join-Path $Repo 'windhawk-portable'
 $relExe = Join-Path $Repo 'windhawk\src\windhawk\Release\windhawk.exe'
-$whcli = Join-Path $Repo 'dist\whcli.exe'
-$whsetup = Join-Path $Repo 'dist\whsetup.exe'
+$whcli  = Join-Path $Repo 'dist\whcli.exe'
+$sign   = Join-Path $PSScriptRoot 'sign.ps1'
 
-foreach ($f in @($relExe, $whcli, $whsetup, (Join-Path $port 'windhawk.ini'))) {
-    if (-not (Test-Path $f)) { throw "missing prerequisite: $f" }
+foreach ($f in @($relExe, $whcli, (Join-Path $port 'windhawk.ini'))) {
+    if (-not (Test-Path $f)) { throw "missing prerequisite: $f (build it first)" }
 }
 
-$out     = Join-Path $Repo 'dist\installer'
-$payload = Join-Path $out 'payload'
-if (Test-Path $out) { Remove-Item $out -Recurse -Force }
-New-Item -ItemType Directory -Force $payload | Out-Null
-
-Write-Host "Copying runtime payload (excluding AppData, windhawk.ini)..."
-& robocopy $port $payload /E /XD (Join-Path $port 'AppData') /XF 'windhawk.ini' '*.orig' /NFL /NDL /NJH /NJS /NP | Out-Null
+# 1. Assemble the payload (runtime minus per-install data, with our rebuilt binaries).
+$stage = Join-Path $Repo 'dist\payload-stage'
+if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+New-Item -ItemType Directory -Force $stage | Out-Null
+Write-Host "Assembling payload..."
+# Lean payload: exclude the 543MB Compiler and 236MB Electron UI — mods come precompiled.
+& robocopy $port $stage /E /XD (Join-Path $port 'AppData') (Join-Path $port 'Compiler') (Join-Path $port 'UI') /XF 'windhawk.ini' '*.orig' /NFL /NDL /NJH /NJS /NP | Out-Null
 if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }
+Copy-Item $relExe (Join-Path $stage 'windhawk.exe') -Force
+Copy-Item $whcli  (Join-Path $stage 'whcli.exe')   -Force
+$ver = (Get-ChildItem (Join-Path $stage 'Engine') -Directory)[0].Name
 
-Write-Host "Overlaying rebranded windhawk.exe + whcli.exe..."
-Copy-Item $relExe (Join-Path $payload 'windhawk.exe') -Force
-Copy-Item $whcli  (Join-Path $payload 'whcli.exe')   -Force
-
-Write-Host "Placing whsetup.exe..."
-Copy-Item $whsetup (Join-Path $out 'whsetup.exe') -Force
-
-if (-not $NoSign) {
-    $ver = (Get-ChildItem (Join-Path $payload 'Engine') -Directory)[0].Name
-    $toSign = @(
-        (Join-Path $payload 'windhawk.exe'),
-        (Join-Path $payload 'whcli.exe'),
-        (Join-Path $payload "Engine\$ver\32\windhawk.dll"),
-        (Join-Path $payload "Engine\$ver\64\windhawk.dll"),
-        (Join-Path $payload "Engine\$ver\arm64\windhawk.dll"),
-        (Join-Path $out 'whsetup.exe')
-    )
-    try {
-        Write-Host "Signing our binaries..."
-        & (Join-Path $PSScriptRoot 'sign.ps1') -Files $toSign
-    } catch {
-        Write-Warning "Signing skipped/failed: $($_.Exception.Message)"
-        Write-Warning "Run scripts\new-signing-cert.ps1 once, then re-run with signing (or pass -NoSign to suppress)."
-    }
+# Bundle ONLY the tiny mod runtime libs (precompiled mods link against these at load).
+$libMap = @{ 'i686-w64-mingw32' = '32'; 'x86_64-w64-mingw32' = '64'; 'aarch64-w64-mingw32' = 'arm64' }
+foreach ($t in $libMap.Keys) {
+    $libsrc = Join-Path $port "Compiler\$t\bin"
+    if (-not (Test-Path $libsrc)) { continue }
+    $libdst = Join-Path $stage "RuntimeLibs\$($libMap[$t])"
+    New-Item -ItemType Directory -Force $libdst | Out-Null
+    Copy-Item (Join-Path $libsrc 'libc++.dll')            (Join-Path $libdst 'libc++.whl')            -Force -ErrorAction SilentlyContinue
+    Copy-Item (Join-Path $libsrc 'libunwind.dll')         (Join-Path $libdst 'libunwind.whl')         -Force -ErrorAction SilentlyContinue
+    Copy-Item (Join-Path $libsrc 'windhawk-mod-shim.dll') (Join-Path $libdst 'windhawk-mod-shim.dll') -Force -ErrorAction SilentlyContinue
 }
 
-$size = [math]::Round((Get-ChildItem $out -Recurse | Measure-Object Length -Sum).Sum / 1MB)
-Write-Host "Installer package ready: $out ($size MB)"
-Write-Host "Distribute by zipping the '$out' folder."
+# 2. Sign the payload binaries (so each is individually trusted at runtime).
+if (-not $NoSign) {
+    try {
+        & $sign -Files @(
+            (Join-Path $stage 'windhawk.exe'),
+            (Join-Path $stage 'whcli.exe'),
+            (Join-Path $stage "Engine\$ver\32\windhawk.dll"),
+            (Join-Path $stage "Engine\$ver\64\windhawk.dll"),
+            (Join-Path $stage "Engine\$ver\arm64\windhawk.dll")
+        )
+    } catch { Write-Warning "payload signing skipped/failed: $($_.Exception.Message)" }
+}
+
+# 3. Zip the payload and place it for embedding into whsetup.
+$payloadZip = Join-Path $Repo 'whsetup\payload.zip'
+Remove-Item $payloadZip -ErrorAction SilentlyContinue
+Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+[System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $payloadZip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+Write-Host "Embedding payload: $([math]::Round((Get-Item $payloadZip).Length/1MB)) MB"
+
+# 4. Build whsetup (the csproj embeds payload.zip -> single self-contained exe).
+Write-Host "Building self-contained installer..."
+& (Join-Path $Repo 'whsetup\build.ps1')
+
+# 5. Sign the single installer and name it by version.
+$built     = Join-Path $Repo 'dist\whsetup.exe'   # whsetup\build.ps1 stages it here
+$installer = Join-Path $Repo "dist\windhawk-cli-$Version-installer.exe"
+Copy-Item $built $installer -Force
+if (-not $NoSign) {
+    try { & $sign -Files @($installer) } catch { Write-Warning "installer signing failed: $($_.Exception.Message)" }
+}
+
+Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+Write-Host "Installer ready: $installer ($([math]::Round((Get-Item $installer).Length/1MB)) MB)"

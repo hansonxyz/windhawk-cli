@@ -1,68 +1,82 @@
-# WindhawkXYZ
+# windhawk-cli
 
-A fork of **Windhawk** focused on **headless, scriptable, fleet-provisionable** use:
-a command-line interface for managing mods, profile-based provisioning, automatic
-mod updates, an optional no-tray mode, and an unattended service installer.
+A **CLI-only, self-updating** alternative to **Windhawk** — built for **headless,
+scriptable, fleet-managed** Windows machines. It runs the same Windhawk engine as a quiet
+Windows service, installs mods as **precompiled binaries** (no local compiler), updates
+both itself and its mods automatically, and exposes the whole mod lifecycle through a
+single command-line tool. There is **no GUI**: the only interactive surface is an optional
+tray icon that opens a small native status dialog.
 
-## What is Windhawk?
+## Why this exists
 
 [Windhawk](https://github.com/ramensoftware/windhawk) (by Ramen Software,
-<https://windhawk.net>) is an open-source customization platform for Windows. It applies
-small C++ "mods" that hook into running Windows programs — the taskbar, File Explorer,
-the Start menu, individual apps — using runtime global injection. Nothing is patched on
-disk; every change is reversible by disabling the mod or stopping the engine.
+<https://windhawk.net>) is an excellent open-source customization platform for Windows. It
+applies small C++ "mods" that hook into running programs — the taskbar, File Explorer, the
+Start menu, individual apps — using runtime global injection. Nothing is patched on disk;
+every change is reversible by disabling the mod or stopping the engine.
 
-For everything about Windhawk itself, the mod catalog, and writing mods, see the
+But stock Windhawk is a **desktop application**: a ~780&nbsp;MB install (Electron GUI +
+bundled LLVM/Clang compiler) that expects a logged-in user to drive setup through a window
+and to click through update prompts. That is the right shape for an enthusiast on their own
+PC, and the wrong shape for **machines you provision and maintain at scale**, where you
+want unattended install, no user interaction, and updates that just happen.
+
+**windhawk-cli** keeps Windhawk's engine and drops everything that requires a human:
+
+- **No GUI, no compiler.** Mods are downloaded **precompiled** from the official catalog
+  (<https://mods.windhawk.net>) instead of being built locally. This removes the 236&nbsp;MB
+  Electron UI and the 543&nbsp;MB compiler toolchain — the installer is a single signed file
+  of roughly **15–20&nbsp;MB**.
+- **Self-updating.** windhawk-cli updates **itself** (the engine + tooling) from its GitHub
+  Releases, verifying the downloaded installer's Authenticode signature against a pinned
+  certificate before applying it — then updates mods. No prompts, no user.
+- **CLI-first.** Every operation — search, install, update, uninstall, enable/disable,
+  settings, profile export/apply — is a `whcli` command suitable for provisioning scripts,
+  configuration management, and remote execution.
+- **Service-based and quiet.** Runs as a Windows service under a **distinct identity
+  (`WindhawkCLI`)** so it can coexist with an official Windhawk install. The tray icon is
+  optional; when shown it opens a native status dialog (loaded mods + Exit), not a GUI app.
+
+> **Tracking upstream.** windhawk-cli's engine is the upstream Windhawk engine. The
+> maintainer intends to **incorporate and merge Windhawk engine updates into windhawk-cli
+> releases** as they ship upstream, so fleets stay current with upstream fixes and new mod
+> capabilities through windhawk-cli's own self-update channel.
+
+For everything about the engine internals, the mod catalog, and writing mods, see the
 **upstream project: <https://github.com/ramensoftware/windhawk>**.
-
-## What this fork adds
-
-Stock Windhawk is a tray app driven by a GUI. This fork makes the same engine usable as
-a quiet, automatable system component you can roll out across many machines:
-
-- **`whcli` — a command-line interface** for the full mod lifecycle: search the catalog,
-  install / update / uninstall, enable / disable, change settings — no GUI required.
-- **Profile-based provisioning** — snapshot a machine's mods and settings to a
-  `profile.json`, then reproduce that exact set on other machines (`export` / `apply`).
-- **Automatic mod updates** — optionally update installed mods *before the engine starts*
-  (so machines come up current) and again on a randomized ~23–24h cycle.
-- **Optional no-tray / headless mode** — run with no system-tray icon.
-- **`whsetup` — an unattended installer** that installs the engine as a Windows service,
-  applies configuration, starts it, and verifies readiness — suitable for provisioning
-  scripts.
-
-It installs under a **distinct identity (`WindhawkXYZ`)** so it can coexist with an
-official Windhawk install.
 
 ## Installation
 
-Run the installer (`whsetup.exe`) as Administrator. Interactive:
+The installer is a single self-contained, signed file. Run it as Administrator.
+
+Interactive:
 
 ```
-whsetup.exe
+windhawk-cli-<version>-installer.exe
 ```
 
 Unattended (e.g. from a provisioning script):
 
 ```
-whsetup.exe --silent --auto-updates --no-system-tray --add-defender-exclusion
+windhawk-cli-<version>-installer.exe --silent --auto-updates --add-defender-exclusion
 ```
 
 | Flag | Effect |
 |------|--------|
 | `--silent`, `-S` | No prompts |
-| `--auto-updates` | Update mods before engine start and every ~23–24h |
-| `--no-system-tray` | Hide the tray icon |
+| `--auto-updates` | Self-update + update mods before engine start, and again every ~23–24h |
+| `--no-system-tray` | Don't show the tray icon (fully headless) |
 | `--add-defender-exclusion` | Add Windows Defender exclusions for the install (see below) |
-| `--install-dir <path>` | Install location (default `C:\Program Files\WindhawkXYZ`) |
+| `--install-dir <path>` | Install location (default `C:\Program Files\WindhawkCLI`) |
 | `--uninstall` | Stop + remove the service and the install |
 
-The installer registers the `WindhawkXYZ` service, starts it, and only completes once a
-readiness check passes — so a script can install mods immediately afterward.
+The installer registers the `WindhawkCLI` service, places the mod runtime libraries, starts
+the service, and only completes once a readiness check passes — so a script can install
+mods immediately afterward.
 
 > Building from source: this is a fork of upstream Windhawk applied as a patch set (see
-> `patches/`) plus the `whcli`/`whsetup` tools. Build it by cloning upstream Windhawk at
-> the commit noted in `patches/README.md`, applying the patch, and running the scripts in
+> `patches/`) plus the `whcli`/`whsetup` tools. Build it by cloning upstream Windhawk at the
+> commit noted in `patches/README.md`, applying the patch, and running the scripts in
 > `scripts/` (and `whcli/build.ps1` / `whsetup/build.ps1`).
 
 ## Basic usage (`whcli`)
@@ -71,65 +85,73 @@ readiness check passes — so a script can install mods immediately afterward.
 service install). For the default service install:
 
 ```
-whcli list   --root "C:\Program Files\WindhawkXYZ"
-whcli catalog "taskbar"                                 # browse the remote mod catalog
-whcli install disable-feedback-hub-hotkey --root "C:\Program Files\WindhawkXYZ"
-whcli set-setting <mod-id> <name> <value> --root "C:\Program Files\WindhawkXYZ"
-whcli disable <mod-id> --root "C:\Program Files\WindhawkXYZ"
-whcli update --root "C:\Program Files\WindhawkXYZ"      # upgrade outdated mods
-whcli status --root "C:\Program Files\WindhawkXYZ" --service WindhawkXYZ
+whcli list    --root "C:\Program Files\WindhawkCLI"
+whcli catalog "taskbar"                                  # browse the remote mod catalog
+whcli install disable-feedback-hub-hotkey --root "C:\Program Files\WindhawkCLI"
+whcli set-setting <mod-id> <name> <value> --root "C:\Program Files\WindhawkCLI"
+whcli disable <mod-id> --root "C:\Program Files\WindhawkCLI"
+whcli update  --root "C:\Program Files\WindhawkCLI"      # upgrade outdated mods (precompiled)
+whcli status  --root "C:\Program Files\WindhawkCLI"
+```
+
+Mods install as **precompiled** DLLs straight from the catalog — no compilation step.
+
+Self-update and automatic updates:
+
+```
+whcli self-update                                        # check GitHub Releases, verify signature, apply
+whcli auto-update                                        # self-update, then update all mods (used by the service)
 ```
 
 Other commands: `uninstall`, `enable`, `search` (alias of `catalog`), `export`, `apply`,
-`tray <show|hide>` (show/hide the system-tray icon at runtime, independent of the startup
-default).
+`tray <show|hide>` (show/hide the tray icon at runtime, independent of the startup default).
 
 ## Scripting & unattended provisioning
 
 The intended workflow for managing a fleet:
 
-1. **Capture** a reference machine's setup to a profile and pin the mod sources:
+1. **Capture** a reference machine's setup to a profile:
    ```
-   whcli export --out profile.json --bundle mods
+   whcli export --out profile.json
    ```
-   Commit `profile.json` and the `mods/` sources to your provisioning repo.
+   Commit `profile.json` to your provisioning repo.
 
 2. **Provision** a target machine unattended — install, then apply the profile:
    ```
-   whsetup.exe --silent --auto-updates --add-defender-exclusion
-   whcli apply profile.json --root "C:\Program Files\WindhawkXYZ" --app-settings
+   windhawk-cli-<version>-installer.exe --silent --auto-updates --add-defender-exclusion
+   whcli apply profile.json --root "C:\Program Files\WindhawkCLI" --app-settings
    ```
-   `apply` installs, compiles, configures, and enables every mod in the profile. Because
-   the installer gates on a readiness check, the `whcli apply` step can run immediately.
+   `apply` downloads (precompiled), configures, and enables every mod in the profile.
+   Because the installer gates on a readiness check, the `whcli apply` step can run
+   immediately afterward.
 
 3. **Verify** (use as the gate in scripts — exits non-zero until ready):
    ```
-   whcli status --root "C:\Program Files\WindhawkXYZ" --service WindhawkXYZ
+   whcli status --root "C:\Program Files\WindhawkCLI"
    ```
 
-`apply` resolves each mod's source from the bundled `mods/` folder first and falls back
-to fetching from the official catalog, so provisioning is reproducible offline.
+With `--auto-updates` enabled, provisioned machines thereafter keep both windhawk-cli and
+their mods current on their own — no return visit, no user interaction.
 
 ## Windows Defender
 
-Windhawk's engine injects a DLL into other processes — legitimate, but a pattern that
+The Windhawk engine injects a DLL into other processes — legitimate, but a pattern that
 Windows Defender's behavioral ML can flag (e.g. `Behavior:Win32/DefenseEvasion.A!ml`) and
-quarantine, especially for a self-built, unsigned binary with no cloud reputation. Two
-mitigations, used together:
+quarantine, especially for a self-built binary with no cloud reputation. Two mitigations,
+used together:
 
-1. **Code signing.** Release binaries are Authenticode-signed by the maintainer, so you
-   can verify their integrity and origin. In a managed environment you control, you may
-   choose to trust that publisher certificate (import it into *Trusted Publishers*) — but
-   only after verifying it yourself; don't import a third-party root just because a README
-   says to.
+1. **Code signing.** Release binaries are Authenticode-signed by the maintainer, so you can
+   verify their integrity and origin (self-update also requires a valid, pinned signature
+   before it will apply an update). In a managed environment you control, you may choose to
+   trust that publisher certificate (import it into *Trusted Publishers*) — but only after
+   verifying it yourself; don't import a third-party root just because a README says to.
 2. **Defender exclusion.** The reliable way to stop the behavioral detection if you trust
-   this software. Pass `--add-defender-exclusion` to the installer, or deploy the
-   exclusions centrally via Intune/GPO (paths `C:\Program Files\WindhawkXYZ` and
-   `C:\ProgramData\WindhawkXYZ`; processes `windhawk.exe`, `whcli.exe`).
+   this software. Pass `--add-defender-exclusion` to the installer, or deploy the exclusions
+   centrally via Intune/GPO (paths `C:\Program Files\WindhawkCLI` and
+   `C:\ProgramData\WindhawkCLI`; processes `windhawk.exe`, `whcli.exe`).
 
 > An exclusion turns off AV coverage for those paths/processes — appropriate only for
-> software you trust. If you'd rather not exclude or trust a prebuilt binary, build from
-> source (see above). This is a known false-positive for legitimate injection-based
+> software you trust. This is a known false-positive for legitimate injection-based
 > customization tools, including upstream Windhawk.
 
 ## License

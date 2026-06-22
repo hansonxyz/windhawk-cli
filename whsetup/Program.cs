@@ -1,16 +1,17 @@
-// whsetup — installer for the WindhawkXYZ fork (Native AOT).
+// whsetup — installer for the WindhawkCLI fork (Native AOT).
 // Interactive by default; flags for unattended install. Installs a LocalSystem
 // service, applies config, starts it, and verifies readiness via whcli.
+using System.Reflection;
 using System.Security.Principal;
 using Microsoft.Win32;
 using Whsetup;
 
-const string Version = "0.1.0";
-const string ServiceName = "WindhawkXYZ";
-const string DisplayName = "Windhawk XYZ";
-const string RegSubKey = @"SOFTWARE\WindhawkXYZ";
-const string DefaultDir = @"C:\Program Files\WindhawkXYZ";
-const string AppDataToken = @"%ProgramData%\WindhawkXYZ";
+const string Version = "1.0.0";
+const string ServiceName = "WindhawkCLI";
+const string DisplayName = "Windhawk CLI";
+const string RegSubKey = @"SOFTWARE\WindhawkCLI";
+const string DefaultDir = @"C:\Program Files\WindhawkCLI";
+const string AppDataToken = @"%ProgramData%\WindhawkCLI";
 
 try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
 
@@ -41,7 +42,7 @@ int Run(string[] a)
 
     if (!silent)
     {
-        Console.WriteLine($"Windhawk XYZ installer {Version}\n");
+        Console.WriteLine($"Windhawk CLI installer {Version}\n");
         dir = Ask("Install location", dir);
         autoUpdates = AskYesNo("Enable automatic mod updates", autoUpdates);
         noTray = AskYesNo("Hide the system tray icon", noTray);
@@ -55,11 +56,11 @@ int Run(string[] a)
 
 int Install(string dir, bool autoUpdates, bool noTray, bool addExclusion)
 {
-    string payload = Path.Combine(AppContext.BaseDirectory, "payload");
+    string payload = ResolvePayload();
     if (!File.Exists(Path.Combine(payload, "windhawk.exe")))
-        throw new FileNotFoundException($"payload not found next to whsetup.exe (looked in {payload})");
+        throw new FileNotFoundException($"payload missing windhawk.exe (looked in {payload})");
     if (!File.Exists(Path.Combine(payload, "whcli.exe")))
-        throw new FileNotFoundException($"whcli.exe missing from payload ({payload})");
+        throw new FileNotFoundException($"payload missing whcli.exe ({payload})");
 
     string engineVer = Path.GetFileName(Directory.GetDirectories(Path.Combine(payload, "Engine"))[0]);
     Console.WriteLine($"Engine version: {engineVer}");
@@ -93,6 +94,24 @@ int Install(string dir, bool autoUpdates, bool noTray, bool addExclusion)
     {
         settings.SetValue("AutomaticUpdates", autoUpdates ? 1 : 0, RegistryValueKind.DWord);
         settings.SetValue("HideTrayIcon", noTray ? 1 : 0, RegistryValueKind.DWord);
+        settings.SetValue("ForkVersion", Version, RegistryValueKind.String);
+    }
+
+    // No compiler is bundled, so place the mod runtime libs (libc++/libunwind/shim)
+    // that precompiled mods link against at load time.
+    string appData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "WindhawkCLI");
+    string runtimeLibs = Path.Combine(payload, "RuntimeLibs");
+    if (Directory.Exists(runtimeLibs))
+    {
+        Console.WriteLine("Placing mod runtime libs...");
+        foreach (var subDir in Directory.GetDirectories(runtimeLibs))
+        {
+            var dst = Path.Combine(appData, "Engine", "Mods", Path.GetFileName(subDir));
+            Directory.CreateDirectory(dst);
+            foreach (var f in Directory.GetFiles(subDir))
+                try { File.Copy(f, Path.Combine(dst, Path.GetFileName(f)), true); }
+                catch (IOException) { /* in use from a prior install; existing copy is fine */ }
+        }
     }
 
     Console.WriteLine($"Registering service '{ServiceName}'...");
@@ -109,7 +128,7 @@ int Install(string dir, bool autoUpdates, bool noTray, bool addExclusion)
         return 2;
     }
 
-    Console.WriteLine($"\nDone. Windhawk XYZ is installed and running.\nManage mods with: \"{Path.Combine(dir, "whcli.exe")}\" --root \"{dir}\" --service {ServiceName} <command>");
+    Console.WriteLine($"\nDone. Windhawk CLI is installed and running.\nManage mods with: \"{Path.Combine(dir, "whcli.exe")}\" --root \"{dir}\" --service {ServiceName} <command>");
     return 0;
 }
 
@@ -151,7 +170,7 @@ int Uninstall(string dir)
         try { Directory.Delete(dir, true); }
         catch (Exception e) { Console.Error.WriteLine($"  could not fully remove {dir}: {e.Message}"); }
     }
-    Console.WriteLine($"Done. (Left in place: %ProgramData%\\WindhawkXYZ and HKLM\\{RegSubKey} — delete manually to purge mods/settings.)");
+    Console.WriteLine($"Done. (Left in place: %ProgramData%\\WindhawkCLI and HKLM\\{RegSubKey} — delete manually to purge mods/settings.)");
     return 0;
 }
 
@@ -168,6 +187,28 @@ static RegistryKey RegistryKeyOpenOrCreate(string subKey)
 {
     using var hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
     return hklm.CreateSubKey(subKey, true);
+}
+
+// Single-file installer: extract the embedded payload.zip to a temp dir and return it.
+// Falls back to a `payload/` folder next to the exe for dev builds with no embed.
+static string ResolvePayload()
+{
+    using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("payload.zip");
+    if (stream is null)
+    {
+        var dir = Path.Combine(AppContext.BaseDirectory, "payload");
+        if (Directory.Exists(dir)) return dir;
+        throw new FileNotFoundException("This whsetup.exe has no embedded payload and no payload\\ folder beside it.");
+    }
+    Console.WriteLine("Extracting payload...");
+    string baseTmp = Path.Combine(Path.GetTempPath(), "whxyz-setup-" + Guid.NewGuid().ToString("N"));
+    string zip = baseTmp + ".zip";
+    string outDir = Path.Combine(baseTmp, "payload");
+    Directory.CreateDirectory(baseTmp);
+    using (var fs = File.Create(zip)) stream.CopyTo(fs);
+    System.IO.Compression.ZipFile.ExtractToDirectory(zip, outDir);
+    try { File.Delete(zip); } catch { }
+    return outDir;
 }
 
 static void CopyDir(string src, string dst, string? skipFileName = null)
@@ -197,13 +238,13 @@ static void CopyDir(string src, string dst, string? skipFileName = null)
 
 static void AddDefenderExclusions(string dir)
 {
-    string pd = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "WindhawkXYZ");
+    string pd = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "WindhawkCLI");
     RunPowerShell($"Add-MpPreference -ExclusionPath '{dir}','{pd}'; Add-MpPreference -ExclusionProcess 'windhawk.exe','whcli.exe'");
 }
 
 static void RemoveDefenderExclusions(string dir)
 {
-    string pd = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "WindhawkXYZ");
+    string pd = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "WindhawkCLI");
     RunPowerShell($"Remove-MpPreference -ExclusionPath '{dir}','{pd}'; Remove-MpPreference -ExclusionProcess 'windhawk.exe','whcli.exe'");
 }
 
@@ -251,7 +292,7 @@ static bool AskYesNo(string prompt, bool def)
 void Help()
 {
     Console.WriteLine($"""
-        whsetup {Version} — Windhawk XYZ installer
+        whsetup {Version} — Windhawk CLI installer
 
         Usage: whsetup [options]
           (no options)            Interactive install
