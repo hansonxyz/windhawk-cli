@@ -149,7 +149,7 @@ index f0f9ffb..a28188f 100644
 +
  }  // namespace Functions
 diff --git a/src/windhawk/app/main_window.cpp b/src/windhawk/app/main_window.cpp
-index 8aa2a60..6b44bb1 100644
+index 8aa2a60..5a31be9 100644
 --- a/src/windhawk/app/main_window.cpp
 +++ b/src/windhawk/app/main_window.cpp
 @@ -1,5 +1,7 @@
@@ -262,6 +262,15 @@ index 8aa2a60..6b44bb1 100644
          std::to_wstring(sessionId);
  
      m_newUpdatesFoundEvent.reset(Functions::CreateEventForMediumIntegrity(
+@@ -1028,7 +1048,7 @@ void CMainWindow::ShowLoadedModsDialog() {
+         .dataSource = CTaskManagerDlg::DataSource::kModStatus,
+         .sessionManagerProcessId = m_serviceInfo.processId,
+         .sessionManagerProcessCreationTime = m_serviceInfo.processCreationTime,
+-        .runButtonCallback = [this](HWND hWnd) { RunUI(hWnd); },
++        // No GUI to open in windhawk-cli; omit the run button (it would do nothing).
+         .finalMessageCallback =
+             [this](HWND hWnd) {
+                 m_modStatusesDlg.reset();
 diff --git a/src/windhawk/app/main_window.h b/src/windhawk/app/main_window.h
 index a62cec7..b6727e7 100644
 --- a/src/windhawk/app/main_window.h
@@ -344,3 +353,24 @@ index 528baff..1056a2e 100644
  
  struct ServiceInfo {
      DWORD version;
+diff --git a/src/windhawk/app/task_manager_dlg.cpp b/src/windhawk/app/task_manager_dlg.cpp
+index f837a9c..dc8695b 100644
+--- a/src/windhawk/app/task_manager_dlg.cpp
++++ b/src/windhawk/app/task_manager_dlg.cpp
+@@ -168,8 +168,14 @@ void CTaskManagerDlg::LoadLanguageStrings() {
+     }
+     SetWindowText(title);
+ 
+-    SetDlgItemText(IDOK,
+-                   Functions::LoadStrFromRsrc(IDS_TASKDLG_BUTTON_OPEN_APP));
++    // windhawk-cli has no GUI to open: hide the "Open Windhawk" button when there's
++    // no run callback (otherwise the button would do nothing when clicked).
++    if (m_dialogOptions.runButtonCallback) {
++        SetDlgItemText(IDOK,
++                       Functions::LoadStrFromRsrc(IDS_TASKDLG_BUTTON_OPEN_APP));
++    } else if (CWindow okButton = GetDlgItem(IDOK)) {
++        okButton.ShowWindow(SW_HIDE);
++    }
+ 
+     UINT columnStringIds[] = {
+         IDS_TASKDLG_COLUMN_MOD,

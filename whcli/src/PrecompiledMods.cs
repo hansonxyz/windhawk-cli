@@ -66,4 +66,46 @@ internal static class PrecompiledMods
             throw new InvalidOperationException($"no precompiled binaries available for {id} {version}");
         return dll;
     }
+
+    /// <summary>
+    /// Install precompiled DLLs from a LOCAL directory (no network) into the engine mods
+    /// folder; returns the generated library file name. The directory must contain the
+    /// per-arch DLLs named "{version}_{sub}.dll" (the same convention the remote
+    /// distribution uses, e.g. 1.3.10_64.dll) or just "{sub}.dll" (e.g. 64.dll).
+    /// Architectures with no local DLL are skipped, mirroring Download().
+    /// </summary>
+    public static string CopyLocal(string engineModsPath, string sourceDir, string id, string version, string[] architectures, bool arm64)
+    {
+        var subs = ModFiles.SubfoldersFor(architectures, arm64);
+        string dll = $"{id}_{version}_{Random.Shared.Next(100000, 1000000)}.dll";
+
+        int got = 0;
+        foreach (var sub in subs)
+        {
+            string? src = FindLocalDll(sourceDir, version, sub);
+            if (src is null)
+            {
+                Console.Error.WriteLine($"    no local {sub} build (looked for {version}_{sub}.dll / {sub}.dll); skipping");
+                continue;
+            }
+            string dest = Path.Combine(engineModsPath, sub, dll);
+            Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+            File.Copy(src, dest, true);
+            got++;
+        }
+        if (got == 0)
+            throw new InvalidOperationException(
+                $"no precompiled DLLs found in '{sourceDir}' (expected e.g. {version}_64.dll or 64.dll)");
+        return dll;
+    }
+
+    private static string? FindLocalDll(string dir, string version, string sub)
+    {
+        foreach (var name in new[] { $"{version}_{sub}.dll", $"{sub}.dll" })
+        {
+            string p = Path.Combine(dir, name);
+            if (File.Exists(p)) return p;
+        }
+        return null;
+    }
 }

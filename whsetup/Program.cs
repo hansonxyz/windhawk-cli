@@ -6,7 +6,7 @@ using System.Security.Principal;
 using Microsoft.Win32;
 using Whsetup;
 
-const string Version = "1.0.0";
+const string Version = "1.0.1";
 const string ServiceName = "WindhawkCLI";
 const string DisplayName = "Windhawk CLI";
 const string RegSubKey = @"SOFTWARE\WindhawkCLI";
@@ -51,7 +51,28 @@ int Run(string[] a)
         if (!AskYesNo("Proceed", true)) { Console.WriteLine("Cancelled."); return 1; }
     }
 
+    // Refuse to clobber an existing install unless explicitly replacing it.
+    bool update = Has(a, "--update") || Has(a, "--force");
+    if (InstallExists(dir) && !update)
+    {
+        if (silent)
+        {
+            Console.Error.WriteLine($"A WindhawkCLI install already exists (dir: {dir}). " +
+                "Pass --update to replace it, or --uninstall to remove it first.");
+            return 1;
+        }
+        if (!AskYesNo("An existing WindhawkCLI install was found. Replace it?", true))
+        { Console.WriteLine("Cancelled."); return 1; }
+    }
+
     return Install(dir, autoUpdates, noTray, addExclusion);
+}
+
+// An install is "present" if our registry hive exists or the install dir has windhawk.exe.
+bool InstallExists(string dir)
+{
+    using var k = Registry.LocalMachine.OpenSubKey(RegSubKey);
+    return k != null || File.Exists(Path.Combine(dir, "windhawk.exe"));
 }
 
 int Install(string dir, bool autoUpdates, bool noTray, bool addExclusion)
@@ -75,8 +96,20 @@ int Install(string dir, bool autoUpdates, bool noTray, bool addExclusion)
     Console.WriteLine("Stopping/removing any existing service...");
     ServiceControl.StopAndDelete(ServiceName);
 
+    // The service alone doesn't hold windhawk.exe — the tray/daemon (windhawk.exe
+    // -tray-only) does. Stop any running app from this dir so the binary can be replaced
+    // (otherwise an update/reinstall silently keeps the old windhawk.exe). It is relaunched
+    // by the service after install.
+    StopRunningApp(dir);
+
     Console.WriteLine($"Copying files to {dir}...");
     CopyDir(payload, dir, skipFileName: "windhawk.ini");
+
+    // During a self-update the OLD whcli.exe that launched us may still be exiting and
+    // hold a lock; CopyDir tolerates in-use files by skipping them, which would leave a
+    // stale binary. Retry these two with a short backoff so an update never lags a version.
+    foreach (var exe in new[] { "whcli.exe", "windhawk.exe" })
+        RetryCopy(Path.Combine(payload, exe), Path.Combine(dir, exe));
 
     Console.WriteLine("Writing windhawk.ini...");
     File.WriteAllText(Path.Combine(dir, "windhawk.ini"),
@@ -87,6 +120,22 @@ int Install(string dir, bool autoUpdates, bool noTray, bool addExclusion)
         "UIPath=UI\r\n" +
         $"AppDataPath={AppDataToken}\r\n" +
         $"RegistryKey=HKLM\\{RegSubKey}\r\n",
+        new System.Text.UTF8Encoding(false));
+
+    // The ENGINE reads its own engine.ini (in Engine\<ver>\), NOT windhawk.ini. The
+    // payload ships the portable one (Portable=1, relative AppDataPath) which points the
+    // service engine at a non-existent portable folder -> zero mods load. Rewrite it for
+    // the non-portable layout: engine AppDataPath/RegistryKey both include the \Engine
+    // segment (the engine reads mods from <AppDataPath>\Mods\<arch> and <RegistryKey>\Mods).
+    Console.WriteLine("Writing engine.ini...");
+    string engineAppData = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+        "WindhawkCLI", "Engine");
+    File.WriteAllText(Path.Combine(dir, "Engine", engineVer, "engine.ini"),
+        "\r\n[Storage]\r\n" +
+        "Portable=0\r\n" +
+        $"AppDataPath={engineAppData}\r\n" +
+        $"RegistryKey=HKLM\\{RegSubKey}\\Engine\r\n",
         new System.Text.UTF8Encoding(false));
 
     Console.WriteLine("Writing settings...");
@@ -211,6 +260,48 @@ static string ResolvePayload()
     return outDir;
 }
 
+// Stop any windhawk.exe (tray/daemon) running from the install dir so its files unlock.
+// It is relaunched by the service after install.
+static void StopRunningApp(string dir)
+{
+    string exe = Path.Combine(dir, "windhawk.exe");
+    if (!File.Exists(exe)) return;
+
+    // Ask a running instance to exit gracefully (targets our daemon via its named objects).
+    try
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo(exe, "-exit -wait")
+        { UseShellExecute = false, CreateNoWindow = true };
+        System.Diagnostics.Process.Start(psi)?.WaitForExit(10000);
+    }
+    catch { }
+
+    // Force-kill anything still running from this dir.
+    foreach (var p in System.Diagnostics.Process.GetProcessesByName("windhawk"))
+    {
+        try
+        {
+            string? path = p.MainModule?.FileName;
+            if (path != null && path.StartsWith(dir, StringComparison.OrdinalIgnoreCase))
+            { p.Kill(); p.WaitForExit(5000); }
+        }
+        catch { /* access denied / exited / cross-bitness — skip */ }
+        finally { p.Dispose(); }
+    }
+}
+
+// Copy a single file, retrying while the destination is briefly locked (up to ~10s).
+static void RetryCopy(string src, string dst, int attempts = 20, int delayMs = 500)
+{
+    if (!File.Exists(src)) return;
+    for (int i = 0; ; i++)
+    {
+        try { File.Copy(src, dst, true); return; }
+        catch (Exception e) when ((e is IOException || e is UnauthorizedAccessException) && i < attempts)
+        { System.Threading.Thread.Sleep(delayMs); }
+    }
+}
+
 static void CopyDir(string src, string dst, string? skipFileName = null)
 {
     Directory.CreateDirectory(dst);
@@ -304,6 +395,7 @@ void Help()
                                   whcli.exe). Needed because the engine's process
                                   injection trips Defender's behavioral heuristics.
           --install-dir <path>    Install location (default: {DefaultDir})
+          --update, --force       Replace an existing install (required if one is present)
           --uninstall             Stop+remove the service and delete the install dir
 
         Must run elevated (installs the '{ServiceName}' LocalSystem service).

@@ -33,25 +33,55 @@ static int Run(string[] args)
     string cmd = args[0];
     string[] rest = args[1..];
 
-    return cmd switch
+    // Serialize mutating operations machine-wide so concurrent automations don't
+    // interleave registry/file writes or race the engine's live reload. Read-only
+    // commands (list/status/catalog/mod-status/export) run without the lock.
+    if (!IsMutating(cmd)) return Dispatch(cmd, rest);
+
+    using var mtx = new System.Threading.Mutex(false, @"Global\WindhawkCLI-cli");
+    bool held = false;
+    try
     {
-        "export" => CmdExport(rest),
-        "apply" => CmdApply(rest),
-        "list" => CmdList(rest),
-        "install" => CmdInstall(rest),
-        "update" => CmdUpdate(rest),
-        "self-update" => CmdSelfUpdate(rest),
-        "auto-update" => CmdAutoUpdate(rest),
-        "uninstall" or "remove" => CmdUninstall(rest),
-        "enable" => CmdEnableDisable(rest, true),
-        "disable" => CmdEnableDisable(rest, false),
-        "tray" => CmdTray(rest),
-        "set-setting" => CmdSetSetting(rest),
-        "status" or "doctor" => CmdStatus(rest),
-        "catalog" or "search" => CmdCatalog(rest),
-        _ => Unknown(cmd),
-    };
+        try { held = mtx.WaitOne(TimeSpan.FromSeconds(60)); }
+        catch (AbandonedMutexException) { held = true; }
+        if (!held)
+        {
+            Console.Error.WriteLine("whcli: another operation is in progress; try again later.");
+            return 3;
+        }
+        return Dispatch(cmd, rest);
+    }
+    finally { if (held) mtx.ReleaseMutex(); }
 }
+
+// Only commands that write mod config/files take the lock. start/stop/restart are service
+// control (no config mutation) and must NOT hold it — the service's own pre-engine-start
+// updater needs the lock, so a start that held it would deadlock its own startup.
+static bool IsMutating(string c) => c is "apply" or "install" or "install-local" or "update"
+    or "self-update" or "auto-update" or "uninstall" or "remove" or "enable" or "disable"
+    or "set-setting" or "tray";
+
+static int Dispatch(string cmd, string[] rest) => cmd switch
+{
+    "export" => CmdExport(rest),
+    "apply" => CmdApply(rest),
+    "list" => CmdList(rest),
+    "install" => CmdInstall(rest),
+    "install-local" => CmdInstallLocal(rest),
+    "update" => CmdUpdate(rest),
+    "self-update" => CmdSelfUpdate(rest),
+    "auto-update" => CmdAutoUpdate(rest),
+    "uninstall" or "remove" => CmdUninstall(rest),
+    "enable" => CmdEnableDisable(rest, true),
+    "disable" => CmdEnableDisable(rest, false),
+    "start" or "stop" or "restart" => CmdService(cmd, rest),
+    "mod-status" => CmdModStatus(rest),
+    "tray" => CmdTray(rest),
+    "set-setting" => CmdSetSetting(rest),
+    "status" or "doctor" => CmdStatus(rest),
+    "catalog" or "search" => CmdCatalog(rest),
+    _ => Unknown(cmd),
+};
 
 static int Unknown(string cmd)
 {
@@ -158,15 +188,86 @@ static int CmdApply(string[] a)
 static int CmdInstall(string[] a)
 {
     var pos = Positionals(a);
-    if (pos.Count < 1) throw new InvalidOperationException("usage: whcli install <mod-id> [--version v] [--root <dir>] [--disabled]");
-    string id = pos[0];
+    if (pos.Count < 1) throw new InvalidOperationException("usage: whcli install <mod-id> [<mod-id>...] [--version v] [--root <dir>] [--disabled]");
 
     var install = ResolveTarget(Opt(a, "--root"));
     var store = install.OpenStore();
+    string? version = Opt(a, "--version");
+    if (pos.Count > 1 && !string.IsNullOrEmpty(version))
+        throw new InvalidOperationException("--version can only be used when installing a single mod");
+    bool disabled = Flag(a, "--disabled");
+    bool arm64 = Arm64Enabled(a);
 
-    // No explicit settings -> the mod uses the defaults declared in its source.
-    InstallMod(install, store, id, Opt(a, "--version") ?? "", Flag(a, "--disabled"), settings: null, Arm64Enabled(a));
-    Console.WriteLine($"Installed {id}.");
+    // Install all requested mods (configs written once each; the engine live-reloads),
+    // then start the service once. Aggregate result: non-zero if any failed (for retries).
+    int failed = 0;
+    foreach (var id in pos)
+    {
+        try
+        {
+            // No explicit settings -> the mod uses the defaults declared in its source.
+            InstallMod(install, store, id, version ?? "", disabled, settings: null, arm64);
+            Console.WriteLine($"Installed {id}.");
+        }
+        catch (Exception e) { Console.Error.WriteLine($"  install {id} failed: {e.Message}"); failed++; }
+    }
+
+    if (failed < pos.Count) EnsureServiceRunning(install, a);
+    if (failed > 0) { Console.Error.WriteLine($"{failed} of {pos.Count} install(s) failed."); return 1; }
+    return 0;
+}
+
+// ---------------------------------------------------------------- install-local
+static int CmdInstallLocal(string[] a)
+{
+    var pos = Positionals(a);
+    if (pos.Count < 1)
+        throw new InvalidOperationException("usage: whcli install-local <dir|.wh.cpp> [--root <dir>] [--disabled] [--arm64]");
+    string srcArg = pos[0];
+
+    // Resolve the .wh.cpp source file and the directory that holds the precompiled DLLs.
+    string srcFile, srcDir;
+    if (Directory.Exists(srcArg))
+    {
+        srcDir = Path.GetFullPath(srcArg);
+        var cpps = Directory.GetFiles(srcDir, "*.wh.cpp");
+        if (cpps.Length == 0) throw new InvalidOperationException($"no .wh.cpp found in '{srcDir}'");
+        if (cpps.Length > 1) throw new InvalidOperationException($"multiple .wh.cpp in '{srcDir}'; point to a specific file");
+        srcFile = cpps[0];
+    }
+    else if (File.Exists(srcArg))
+    {
+        srcFile = Path.GetFullPath(srcArg);
+        srcDir = Path.GetDirectoryName(srcFile)!;
+    }
+    else throw new InvalidOperationException($"source not found: '{srcArg}'");
+
+    string source = File.ReadAllText(srcFile);
+    var meta = ModMetadata.Parse(source);
+    if (string.IsNullOrEmpty(meta.Id)) throw new InvalidOperationException($"'{srcFile}' is missing an @id header");
+
+    var install = ResolveTarget(Opt(a, "--root"));
+    var store = install.OpenStore();
+    bool arm64 = Arm64Enabled(a);
+
+    string dll = PrecompiledMods.CopyLocal(install.EngineModsPath, srcDir, meta.Id, meta.Version, meta.Architecture, arm64);
+
+    store.SetModConfig(meta.Id, new ModConfig
+    {
+        LibraryFileName = dll,
+        Disabled = Flag(a, "--disabled"),
+        Include = meta.Include,
+        Exclude = meta.Exclude,
+        Architecture = meta.Architecture,
+        Version = meta.Version,
+    });
+
+    Directory.CreateDirectory(install.ModsSourcePath);
+    File.WriteAllText(Path.Combine(install.ModsSourcePath, meta.Id + ".wh.cpp"), source);
+    ModFiles.DeleteOld(install.EngineModsPath, meta.Id, ModFiles.SubfoldersFor(meta.Architecture, arm64), dll);
+
+    Console.WriteLine($"Installed {meta.Id} v{meta.Version} from local source ({srcDir}).");
+    EnsureServiceRunning(install, a);
     return 0;
 }
 
@@ -211,11 +312,21 @@ static int CmdUpdate(string[] a)
     bool noReload = Flag(a, "--no-reload"); // skip the disable/enable dance (engine not running yet)
     var store = install.OpenStore();
 
+    // Optional positional mod ids restrict the update to those mods; no ids = all mods.
+    var only = new HashSet<string>(Positionals(a), StringComparer.OrdinalIgnoreCase);
+    if (only.Count > 0)
+    {
+        var installedIds = new HashSet<string>(store.GetInstalledModIds(), StringComparer.OrdinalIgnoreCase);
+        foreach (var req in only)
+            if (!installedIds.Contains(req)) Console.Error.WriteLine($"  (not installed, skipping: {req})");
+    }
+
     var latest = FetchCatalogVersions();
 
     var outdated = new List<(string id, string from, string to, bool enabled)>();
     foreach (var id in store.GetInstalledModIds())
     {
+        if (only.Count > 0 && !only.Contains(id)) continue;
         var cfg = store.GetModConfig(id);
         if (cfg is null) continue;
         if (!latest.TryGetValue(id, out var newVer)) continue; // local-only mod, not in catalog
@@ -322,10 +433,17 @@ static int CmdList(string[] a)
 static int CmdEnableDisable(string[] a, bool enable)
 {
     var pos = Positionals(a);
-    if (pos.Count < 1) throw new InvalidOperationException($"usage: whcli {(enable ? "enable" : "disable")} <mod-id> [--root <dir>]");
-    var store = ResolveTarget(Opt(a, "--root")).OpenStore();
-    store.EnableMod(pos[0], enable);
-    Console.WriteLine($"{(enable ? "Enabled" : "Disabled")} {pos[0]}.");
+    if (pos.Count < 1) throw new InvalidOperationException($"usage: whcli {(enable ? "enable" : "disable")} <mod-id> [<mod-id>...] [--root <dir>]");
+    var install = ResolveTarget(Opt(a, "--root"));
+    var store = install.OpenStore();
+    int failed = 0;
+    foreach (var id in pos)
+    {
+        try { store.EnableMod(id, enable); Console.WriteLine($"{(enable ? "Enabled" : "Disabled")} {id}."); }
+        catch (Exception e) { Console.Error.WriteLine($"  {id} failed: {e.Message}"); failed++; }
+    }
+    if (enable && failed < pos.Count) EnsureServiceRunning(install, a);
+    if (failed > 0) return 1;
     return 0;
 }
 
@@ -424,7 +542,7 @@ static int DoSelfUpdate(WindhawkInstall install, string exeUrl, string version, 
     }
 
     // Launch the new installer detached, preserving the current configuration.
-    var args = new List<string> { "--silent", "--install-dir", install.RootPath, "--add-defender-exclusion" };
+    var args = new List<string> { "--silent", "--update", "--install-dir", install.RootPath, "--add-defender-exclusion" };
     if (settings.TryGetValue("AutomaticUpdates", out var au) && au.IsInt && au.Int != 0) args.Add("--auto-updates");
     if (settings.TryGetValue("HideTrayIcon", out var ht) && ht.IsInt && ht.Int != 0) args.Add("--no-system-tray");
 
@@ -511,6 +629,99 @@ static int CmdStatus(string[] a)
 
     Console.WriteLine(ok ? "READY" : "NOT READY");
     return ok ? 0 : 1;
+}
+
+// ---------------------------------------------------------------- service control
+static string SvcName(string[] a) => Opt(a, "--service") ?? "WindhawkCLI";
+
+static int CmdService(string cmd, string[] a)
+{
+    var install = ResolveTarget(Opt(a, "--root"));
+    if (install.Portable)
+        throw new InvalidOperationException($"'{cmd}' applies to a service install; this target is portable.");
+    string svc = SvcName(a);
+    bool ok; string err;
+    switch (cmd)
+    {
+        case "start": ok = ServiceControl.Start(svc, out err); break;
+        case "stop":  ok = ServiceControl.Stop(svc, out err); break;
+        default:      ok = ServiceControl.Restart(svc, out err); break; // restart, valid from stopped
+    }
+    if (!ok) { Console.Error.WriteLine($"{cmd} '{svc}' failed: {err}"); return 1; }
+    Console.WriteLine($"Service '{svc}' {(cmd == "stop" ? "stopped" : "running")}.");
+    return 0;
+}
+
+/// <summary>Best-effort: ensure the service is running after a mod becomes active (always-on model).</summary>
+static void EnsureServiceRunning(WindhawkInstall install, string[] a)
+{
+    if (install.Portable) return;
+    string svc = SvcName(a);
+    string state = ServiceQuery.State(svc);
+    if (state == "running") return;
+    if (state == "not-installed") return; // no service to start (CLI used standalone)
+    if (ServiceControl.Start(svc, out var err))
+        Console.WriteLine($"Started service '{svc}'.");
+    else
+        Console.Error.WriteLine($"  (could not start '{svc}': {err}; mods are configured and load when it starts)");
+}
+
+// ---------------------------------------------------------------- mod-status
+static int CmdModStatus(string[] a)
+{
+    var pos = Positionals(a);
+    if (pos.Count < 1) throw new InvalidOperationException("usage: whcli mod-status <mod-id> [--root <dir>]");
+    string id = pos[0];
+
+    var install = ResolveTarget(Opt(a, "--root"));
+    var cfg = install.OpenStore().GetModConfig(id);
+    if (cfg is null) { Console.Error.WriteLine($"mod '{id}' is not installed."); return 1; }
+
+    string Join(string[] v) => v.Length == 0 ? "" : string.Join(", ", v);
+    Console.WriteLine($"Mod:          {id}");
+    Console.WriteLine($"Version:      {cfg.Version}");
+    Console.WriteLine($"State:        {(cfg.Disabled ? "disabled" : "enabled")}");
+    Console.WriteLine($"Library:      {cfg.LibraryFileName}");
+    Console.WriteLine($"Architecture: {(cfg.Architecture.Length == 0 ? "(all)" : Join(cfg.Architecture))}");
+    Console.WriteLine($"Include:      {Join(cfg.Include)}");
+    if (cfg.Exclude.Length > 0) Console.WriteLine($"Exclude:      {Join(cfg.Exclude)}");
+
+    Console.WriteLine("Compiled DLLs:");
+    foreach (var sub in ModFiles.AllSubfolders(true))
+    {
+        string p = Path.Combine(install.EngineModsPath, sub, cfg.LibraryFileName);
+        Console.WriteLine($"  [{(File.Exists(p) ? "x" : " ")}] {sub}\\{cfg.LibraryFileName}");
+    }
+
+    Console.WriteLine("Loaded in processes (live):");
+    var hits = LiveModProcesses(cfg.LibraryFileName);
+    if (hits.Count == 0)
+        Console.WriteLine("  (none — not currently injected, or the engine isn't running)");
+    else
+        foreach (var h in hits) Console.WriteLine($"  {h}");
+
+    if (!install.Portable)
+        Console.WriteLine($"Service:      {ServiceQuery.State(SvcName(a))}");
+    return 0;
+}
+
+/// <summary>Scan running processes for a mod's loaded DLL (real proof it's injected).</summary>
+static List<string> LiveModProcesses(string libraryFileName)
+{
+    var result = new List<string>();
+    foreach (var p in System.Diagnostics.Process.GetProcesses())
+    {
+        try
+        {
+            foreach (System.Diagnostics.ProcessModule m in p.Modules)
+                if (string.Equals(m.ModuleName, libraryFileName, StringComparison.OrdinalIgnoreCase))
+                { result.Add($"{p.ProcessName} (PID {p.Id})"); break; }
+        }
+        catch { /* access denied / exited — skip */ }
+        finally { p.Dispose(); }
+    }
+    result.Sort();
+    return result;
 }
 
 // ---------------------------------------------------------------- catalog / search
@@ -620,16 +831,29 @@ static void PrintHelp()
 
         Single mods (target = --root <dir> or $WHCLI_ROOT):
           list
-          install <id> [--version v] [--disabled] [--no-fetch] [--arm64]
-          update [--dry-run] [--no-reload]   Upgrade outdated mods to catalog latest
+          install <id> [<id>...] [--version v] [--disabled] [--arm64]
+                                  Install one or more PRECOMPILED mods from the catalog,
+                                  then start the service (mods go live immediately).
+          install-local <dir|.wh.cpp> [--disabled] [--arm64]
+                                  Install a PRECOMPILED mod from a local folder (no network):
+                                  the dir holds <id>.wh.cpp plus DLLs named <version>_<sub>.dll
+                                  (e.g. 1.3.10_64.dll) or <sub>.dll (e.g. 64.dll).
+          update [<id>...] [--dry-run] [--no-reload]
+                                  Upgrade mods to catalog latest (no ids = all installed)
           self-update [--dry-run]            Update the app itself (signed) from the release feed
           auto-update                        self-update if available, otherwise update mods
           uninstall <id>
-          enable <id>
-          disable <id>
+          enable <id> [<id>...]              (also starts the service)
+          disable <id> [<id>...]
+          mod-status <id>                    Config, compiled DLLs, and live injected processes
           tray <show|hide>                   Show/hide the system tray icon at runtime
           set-setting <id> <name> <value>
           status [--service <name>]          Readiness check (exit 0 when ready)
+
+        Service control (non-portable installs; need elevation):
+          start [--service <name>]           Start the engine service
+          stop  [--service <name>]           Stop the engine service
+          restart [--service <name>]         Restart (valid even from a stopped state)
 
         Browse the remote catalog (https://mods.windhawk.net/catalog.json):
           catalog [query] [--full] [--ids]    List all mods with names/descriptions

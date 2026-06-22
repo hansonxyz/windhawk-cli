@@ -68,11 +68,15 @@ windhawk-cli-<version>-installer.exe --silent --auto-updates --add-defender-excl
 | `--no-system-tray` | Don't show the tray icon (fully headless) |
 | `--add-defender-exclusion` | Add Windows Defender exclusions for the install (see below) |
 | `--install-dir <path>` | Install location (default `C:\Program Files\WindhawkCLI`) |
+| `--update`, `--force` | Replace an existing install (a plain install refuses if one is present) |
 | `--uninstall` | Stop + remove the service and the install |
 
 The installer registers the `WindhawkCLI` service, places the mod runtime libraries, starts
 the service, and only completes once a readiness check passes — so a script can install
-mods immediately afterward.
+mods immediately afterward. If an install already exists it **refuses unless `--update`** is
+given (so you don't clobber one by accident); `whcli self-update` passes `--update`
+automatically. On update it stops the running service and app so the binaries can be
+replaced, then restarts.
 
 > Building from source: this is a fork of upstream Windhawk applied as a patch set (see
 > `patches/`) plus the `whcli`/`whsetup` tools. Build it by cloning upstream Windhawk at the
@@ -87,24 +91,44 @@ service install). For the default service install:
 ```
 whcli list    --root "C:\Program Files\WindhawkCLI"
 whcli catalog "taskbar"                                  # browse the remote mod catalog
-whcli install disable-feedback-hub-hotkey --root "C:\Program Files\WindhawkCLI"
-whcli set-setting <mod-id> <name> <value> --root "C:\Program Files\WindhawkCLI"
-whcli disable <mod-id> --root "C:\Program Files\WindhawkCLI"
-whcli update  --root "C:\Program Files\WindhawkCLI"      # upgrade outdated mods (precompiled)
-whcli status  --root "C:\Program Files\WindhawkCLI"
+whcli install f1-blocker passkey-popup-blocker          # one OR MANY ids in one call
+whcli set-setting <mod-id> <name> <value>
+whcli disable <mod-id>                                   # enable/disable also accept many ids
+whcli update [<mod-id>...]                               # no ids = all outdated; or name specific mods
+whcli mod-status <mod-id>                                # config, compiled DLLs, live injected processes
+whcli status                                            # readiness check (exit 0 when ready)
 ```
 
+(`--root "C:\Program Files\WindhawkCLI"` applies to every command; omitted above for brevity.)
+
 Mods install as **precompiled** DLLs straight from the catalog — no compilation step.
+Installing or enabling a mod also **starts the service** if it isn't already running, and the
+engine live-reloads, so the change goes online immediately.
+
+Install a **precompiled mod from a local folder** (no network) — the folder holds the mod's
+`<id>.wh.cpp` plus DLLs named `<version>_<sub>.dll` (e.g. `1.3.10_64.dll`) or `<sub>.dll`:
+
+```
+whcli install-local C:\mods\taskbar-grouping
+```
+
+Service control (needs elevation):
+
+```
+whcli start | stop | restart        # restart is valid even from a stopped state
+```
 
 Self-update and automatic updates:
 
 ```
-whcli self-update                                        # check GitHub Releases, verify signature, apply
-whcli auto-update                                        # self-update, then update all mods (used by the service)
+whcli self-update                   # check GitHub Releases, verify the pinned signature, apply
+whcli auto-update                   # self-update, then update all mods (used by the service)
 ```
 
 Other commands: `uninstall`, `enable`, `search` (alias of `catalog`), `export`, `apply`,
 `tray <show|hide>` (show/hide the tray icon at runtime, independent of the startup default).
+Mutating commands are serialized machine-wide by a mutex, so concurrent automation runs are
+safe; failures return a non-zero exit code so scripts can retry.
 
 ## Scripting & unattended provisioning
 
@@ -132,6 +156,39 @@ The intended workflow for managing a fleet:
 
 With `--auto-updates` enabled, provisioned machines thereafter keep both windhawk-cli and
 their mods current on their own — no return visit, no user interaction.
+
+## Worked example (silent install → mods → settings)
+
+A complete, copy-pasteable flow (run elevated). The installer starts the service and only
+returns once it is READY, so the `whcli` calls right after it work immediately.
+
+```powershell
+$root = "C:\Program Files\WindhawkCLI"
+$whcli = "$root\whcli.exe"
+
+# 1. Install silently: service install, auto-updates on, Defender exclusion added.
+#    Use --update to replace an existing install (plain install refuses if one is present).
+.\windhawk-cli-1.0.1-installer.exe --silent --auto-updates --add-defender-exclusion
+
+# 2. Install a couple of mods (one call → one service start; both go live at once).
+& $whcli install disable-feedback-hub-hotkey f1-blocker --root $root
+
+# 3. Configure a mod's settings via the CLI, then change one later.
+& $whcli set-setting passkey-popup-blocker timeout 800 --root $root
+& $whcli install passkey-popup-blocker --root $root          # install it first
+& $whcli set-setting passkey-popup-blocker block_result user_cancelled --root $root
+
+# 4. Inspect a mod: config, compiled DLLs, and which processes it's injected into.
+& $whcli mod-status passkey-popup-blocker --root $root
+
+# 5. Service control (the engine live-applies config, so this is only for explicit control).
+& $whcli restart --root $root      # e.g. after a big batch of changes
+```
+
+If the service is running, every install/enable/disable/set-setting takes effect right away
+(the engine watches its config and reloads). If you stopped it, changes are persisted and
+load the next time it starts. To update later without waiting for auto-update:
+`whcli update` (all mods) or `whcli update <id>`; `whcli self-update` for the app itself.
 
 ## Windows Defender
 
