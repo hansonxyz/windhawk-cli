@@ -3,7 +3,9 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using Whcli;
 
-const string Version = "0.1.0";
+const string Version = "0.2.0";
+
+try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { /* redirected console */ }
 
 try
 {
@@ -41,7 +43,7 @@ static int Run(string[] args)
         "enable" => CmdEnableDisable(rest, true),
         "disable" => CmdEnableDisable(rest, false),
         "set-setting" => CmdSetSetting(rest),
-        "search" => CmdSearch(rest),
+        "catalog" or "search" => CmdCatalog(rest),
         _ => Unknown(cmd),
     };
 }
@@ -250,33 +252,52 @@ static int CmdSetSetting(string[] a)
     return 0;
 }
 
-// ---------------------------------------------------------------- search
-static int CmdSearch(string[] a)
+// ---------------------------------------------------------------- catalog / search
+static int CmdCatalog(string[] a)
 {
     var pos = Positionals(a);
     string query = pos.Count > 0 ? pos[0] : "";
+    bool full = Flag(a, "--full");
+    bool idsOnly = Flag(a, "--ids");
 
     using var http = new HttpClient();
     http.DefaultRequestHeaders.UserAgent.ParseAdd("whcli");
-    var json = http.GetStringAsync("https://api.github.com/repos/ramensoftware/windhawk-mods/contents/mods")
-                   .GetAwaiter().GetResult();
-
+    // The official mod catalog: { app, mods: { "<id>": { metadata: {...} } } }.
+    var json = http.GetStringAsync("https://mods.windhawk.net/catalog.json").GetAwaiter().GetResult();
     using var doc = JsonDocument.Parse(json);
-    int n = 0;
-    foreach (var item in doc.RootElement.EnumerateArray())
+
+    var rows = new List<(string id, string name, string ver, string author, string desc)>();
+    int total = 0;
+    foreach (var m in doc.RootElement.GetProperty("mods").EnumerateObject())
     {
-        var name = item.GetProperty("name").GetString() ?? "";
-        if (!name.EndsWith(".wh.cpp")) continue;
-        var id = name[..^".wh.cpp".Length];
-        if (query.Length == 0 || id.Contains(query, StringComparison.OrdinalIgnoreCase))
+        total++;
+        var meta = m.Value.GetProperty("metadata");
+        string name = Str(meta, "name"), ver = Str(meta, "version"),
+               author = Str(meta, "author"), desc = Str(meta, "description");
+        if (query.Length > 0)
         {
-            Console.WriteLine(id);
-            n++;
+            string hay = $"{m.Name} {name} {desc} {author}";
+            if (!hay.Contains(query, StringComparison.OrdinalIgnoreCase)) continue;
         }
+        rows.Add((m.Name, name, ver, author, desc));
     }
-    Console.Error.WriteLine($"{n} mod(s)" + (query.Length > 0 ? $" matching '{query}'" : ""));
+    rows.Sort((x, y) => string.CompareOrdinal(x.id, y.id));
+
+    foreach (var r in rows)
+    {
+        if (idsOnly) { Console.WriteLine(r.id); continue; }
+        Console.WriteLine($"{r.id}  v{r.ver}" + (r.author.Length > 0 ? $"  ({r.author})" : ""));
+        var d = r.desc.Replace("\r", " ").Replace("\n", " ").Trim();
+        if (!full && d.Length > 100) d = d[..97] + "...";
+        var line = r.name + (d.Length > 0 ? "  —  " + d : "");
+        if (line.Length > 0) Console.WriteLine("    " + line);
+    }
+    Console.Error.WriteLine($"{rows.Count} mod(s)" + (query.Length > 0 ? $" matching '{query}'" : "") + $" of {total} in catalog");
     return 0;
 }
+
+static string Str(JsonElement e, string name)
+    => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
 
 // ---------------------------------------------------------------- helpers
 static WindhawkInstall ResolveTarget(string? rootOpt)
@@ -343,7 +364,10 @@ static void PrintHelp()
           enable <id>
           disable <id>
           set-setting <id> <name> <value>
-          search [query]
+
+        Browse the remote catalog (https://mods.windhawk.net/catalog.json):
+          catalog [query] [--full] [--ids]    List all mods with names/descriptions
+          search  [query]                     Alias for catalog (filter by query)
 
         Notes:
           * A "target" is a Windhawk root dir containing windhawk.ini (portable build).
