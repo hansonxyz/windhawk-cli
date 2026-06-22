@@ -37,6 +37,13 @@ want unattended install, no user interaction, and updates that just happen.
   (`WindhawkCLI`)** so it can coexist with an official Windhawk install. The tray icon is
   optional; when shown it opens a native status dialog (loaded mods + Exit), not a GUI app.
 
+> **System-wide, not per-user.** windhawk-cli installs at the **machine level** — its mods and
+> settings live in `HKLM\SOFTWARE\WindhawkCLI` and `C:\ProgramData\WindhawkCLI`, and the engine
+> runs as a LocalSystem service that injects across **all** user sessions. There is one
+> configuration per machine, and it applies to **every logged-in user** (there is no per-user
+> mod set or isolation between accounts). Installing/configuring mods therefore requires
+> elevation. This is intentional for fleet provisioning.
+
 > **Tracking upstream.** windhawk-cli's engine is the upstream Windhawk engine. The
 > maintainer intends to **incorporate and merge Windhawk engine updates into windhawk-cli
 > releases** as they ship upstream, so fleets stay current with upstream fixes and new mod
