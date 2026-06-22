@@ -16,6 +16,12 @@
 [Oo]bj/
 *.user
 
+# Built whcli.exe is a derived artifact (rebuild via whcli\build.ps1)
+/dist/
+
+# NOTE: profile.json (the canonical deployment profile) and mods/ (pinned mod
+# sources) ARE committed on purpose -- they are the reproducible provisioning input.
+
 # Ad-hoc / machine-specific profile exports (the reviewed profile is committed explicitly)
 *.local.json
 
