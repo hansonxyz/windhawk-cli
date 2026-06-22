@@ -39,6 +39,7 @@ static int Run(string[] args)
         "apply" => CmdApply(rest),
         "list" => CmdList(rest),
         "install" => CmdInstall(rest),
+        "update" => CmdUpdate(rest),
         "uninstall" or "remove" => CmdUninstall(rest),
         "enable" => CmdEnableDisable(rest, true),
         "disable" => CmdEnableDisable(rest, false),
@@ -198,6 +199,133 @@ static void InstallMod(WindhawkInstall install, IModStore store, SourceProvider 
 
     // Drop stale builds from previous installs so the mods folder stays clean.
     compiler.CleanupOldFiles(id, meta.Architecture, dll);
+}
+
+// ---------------------------------------------------------------- update
+static int CmdUpdate(string[] a)
+{
+    var install = ResolveTarget(Opt(a, "--root"));
+    bool dryRun = Flag(a, "--dry-run");
+    bool noReload = Flag(a, "--no-reload"); // skip the disable/enable dance (engine not running yet)
+    var store = install.OpenStore();
+
+    var latest = FetchCatalogVersions();
+
+    var outdated = new List<(string id, string from, string to, bool enabled)>();
+    foreach (var id in store.GetInstalledModIds())
+    {
+        var cfg = store.GetModConfig(id);
+        if (cfg is null) continue;
+        if (!latest.TryGetValue(id, out var newVer)) continue; // local-only mod, not in catalog
+        if (CompareVersions(newVer, cfg.Version) > 0)
+            outdated.Add((id, cfg.Version, newVer, !cfg.Disabled));
+    }
+
+    if (outdated.Count == 0) { Console.WriteLine("All mods up to date."); return 0; }
+
+    Console.WriteLine($"{outdated.Count} update(s) available:");
+    foreach (var o in outdated)
+        Console.WriteLine($"  {o.id}  {o.from} -> {o.to}" + (o.enabled ? "" : " (disabled)"));
+    if (dryRun) return 0;
+
+    var compiler = new ModCompiler(install, Arm64Enabled(a));
+    int ok = 0, fail = 0;
+    foreach (var o in outdated)
+    {
+        try
+        {
+            UpdateOne(install, store, compiler, o.id, o.enabled, noReload);
+            Console.WriteLine($"  updated {o.id} -> {o.to}");
+            ok++;
+        }
+        catch (Exception e) { Console.Error.WriteLine($"  FAIL {o.id}: {e.Message}"); fail++; }
+    }
+    Console.WriteLine($"Done: {ok} updated, {fail} failed.");
+    return fail == 0 ? 0 : 1;
+}
+
+/// <summary>Update one mod, optionally doing the disable -> swap -> enable dance for a live engine.</summary>
+static void UpdateOne(WindhawkInstall install, IModStore store, ModCompiler compiler,
+                      string id, bool enabled, bool noReload)
+{
+    bool dance = enabled && !noReload;
+    if (dance)
+    {
+        store.EnableMod(id, false);          // tell the live engine to unload the old DLL
+        System.Threading.Thread.Sleep(800);  // give it a moment to release the file
+    }
+
+    try
+    {
+        string source = FetchLatestSource(id);
+        var meta = ModMetadata.Parse(source);
+        if (meta.Id != id)
+            throw new InvalidOperationException($"source @id '{meta.Id}' != '{id}'");
+
+        string dll = compiler.CompileMod(id, meta.Version, meta.Include, source, meta.Architecture, meta.CompilerOptions);
+        store.SetModConfig(id, new ModConfig
+        {
+            LibraryFileName = dll,
+            Disabled = dance ? true : !enabled, // keep disabled during the swap when dancing
+            Include = meta.Include,
+            Exclude = meta.Exclude,
+            Architecture = meta.Architecture,
+            Version = meta.Version,
+        });
+        // Settings are intentionally preserved (not touched) across an update.
+        Directory.CreateDirectory(install.ModsSourcePath);
+        File.WriteAllText(Path.Combine(install.ModsSourcePath, id + ".wh.cpp"), source);
+        compiler.CleanupOldFiles(id, meta.Architecture, dll);
+    }
+    finally
+    {
+        // Restore the original enabled state. For a live update this is the "enable after"
+        // step that makes the engine load the new DLL; on failure it restores the old version.
+        store.EnableMod(id, enabled);
+        if (dance) System.Threading.Thread.Sleep(150);
+    }
+}
+
+static string FetchLatestSource(string id)
+{
+    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+    http.DefaultRequestHeaders.UserAgent.ParseAdd("whcli");
+    return http.GetStringAsync($"https://mods.windhawk.net/mods/{id}.wh.cpp").GetAwaiter().GetResult();
+}
+
+static Dictionary<string, string> FetchCatalogVersions()
+{
+    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+    http.DefaultRequestHeaders.UserAgent.ParseAdd("whcli");
+    var json = http.GetStringAsync("https://mods.windhawk.net/catalog.json").GetAwaiter().GetResult();
+    using var doc = JsonDocument.Parse(json);
+    var result = new Dictionary<string, string>(StringComparer.Ordinal);
+    foreach (var m in doc.RootElement.GetProperty("mods").EnumerateObject())
+        result[m.Name] = Str(m.Value.GetProperty("metadata"), "version");
+    return result;
+}
+
+/// <summary>Compare dotted numeric versions (e.g. 1.3.10 vs 1.3.2). Returns -1/0/1.</summary>
+static int CompareVersions(string a, string b)
+{
+    var pa = a.Split('.');
+    var pb = b.Split('.');
+    int n = Math.Max(pa.Length, pb.Length);
+    for (int i = 0; i < n; i++)
+    {
+        string sa = i < pa.Length ? pa[i] : "0";
+        string sb = i < pb.Length ? pb[i] : "0";
+        if (int.TryParse(sa, out var ia) && int.TryParse(sb, out var ib))
+        {
+            if (ia != ib) return ia < ib ? -1 : 1;
+        }
+        else
+        {
+            int c = string.CompareOrdinal(sa, sb);
+            if (c != 0) return c < 0 ? -1 : 1;
+        }
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------- list / enable / disable / uninstall / set-setting
@@ -360,6 +488,7 @@ static void PrintHelp()
         Single mods (target = --root <dir> or $WHCLI_ROOT):
           list
           install <id> [--version v] [--disabled] [--no-fetch] [--arm64]
+          update [--dry-run] [--no-reload]   Upgrade outdated mods to catalog latest
           uninstall <id>
           enable <id>
           disable <id>
