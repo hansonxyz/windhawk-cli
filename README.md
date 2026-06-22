@@ -61,8 +61,9 @@ The installer registers the `WindhawkXYZ` service, starts it, and only completes
 readiness check passes — so a script can install mods immediately afterward.
 
 > Building from source: this is a fork of upstream Windhawk applied as a patch set (see
-> `patches/`) plus the `whcli`/`whsetup` tools. Build/packaging steps are documented in
-> `CLAUDE.md`.
+> `patches/`) plus the `whcli`/`whsetup` tools. Build it by cloning upstream Windhawk at
+> the commit noted in `patches/README.md`, applying the patch, and running the scripts in
+> `scripts/` (and `whcli/build.ps1` / `whsetup/build.ps1`).
 
 ## Basic usage (`whcli`)
 
@@ -116,17 +117,20 @@ Windows Defender's behavioral ML can flag (e.g. `Behavior:Win32/DefenseEvasion.A
 quarantine, especially for a self-built, unsigned binary with no cloud reputation. Two
 mitigations, used together:
 
-1. **Code signing + trust.** Releases are Authenticode-signed. Trust the public signing
-   certificate on your machines (import it into *Trusted Root* and *Trusted Publishers*),
-   after which the binaries validate as trusted.
-2. **Defender exclusion.** The reliable stop for the behavioral detection. Pass
-   `--add-defender-exclusion` to the installer, or deploy the exclusions centrally via
-   Intune/GPO (paths `C:\Program Files\WindhawkXYZ` and `C:\ProgramData\WindhawkXYZ`;
-   processes `windhawk.exe`, `whcli.exe`).
+1. **Code signing.** Release binaries are Authenticode-signed by the maintainer, so you
+   can verify their integrity and origin. In a managed environment you control, you may
+   choose to trust that publisher certificate (import it into *Trusted Publishers*) — but
+   only after verifying it yourself; don't import a third-party root just because a README
+   says to.
+2. **Defender exclusion.** The reliable way to stop the behavioral detection if you trust
+   this software. Pass `--add-defender-exclusion` to the installer, or deploy the
+   exclusions centrally via Intune/GPO (paths `C:\Program Files\WindhawkXYZ` and
+   `C:\ProgramData\WindhawkXYZ`; processes `windhawk.exe`, `whcli.exe`).
 
 > An exclusion turns off AV coverage for those paths/processes — appropriate only for
-> first-party software you build, sign, and trust. Fleet steps are in
-> `docs/fleet-cert-trust.md`.
+> software you trust. If you'd rather not exclude or trust a prebuilt binary, build from
+> source (see above). This is a known false-positive for legitimate injection-based
+> customization tools, including upstream Windhawk.
 
 ## License
 
