@@ -35,3 +35,11 @@
 Thumbs.db
 desktop.ini
 .vs/
+
+# Internal / dev-only — excluded from the public repo (kept locally, not published)
+/CLAUDE.md
+/profile.json
+/mods/
+/certs/
+/docs/fleet-cert-trust.md
+/scripts/fleet-trust-cert.ps1
