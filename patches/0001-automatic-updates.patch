@@ -1,0 +1,187 @@
+diff --git a/src/windhawk/app/app.cpp b/src/windhawk/app/app.cpp
+index 3941a75..1a0059e 100644
+--- a/src/windhawk/app/app.cpp
++++ b/src/windhawk/app/app.cpp
+@@ -314,6 +314,17 @@ void RunDaemon() {
+     CMessageLoopAlwaysRunOnIdle loop;
+     _Module.AddMessageLoop(&loop);
+ 
++    // AutomaticUpdates: for the portable version this process hosts the engine, so
++    // update mods now, synchronously, before the engine starts and injects anything.
++    if (portable &&
++        StorageManager::GetInstance()
++            .GetAppConfig(L"Settings", false)
++            ->GetInt(L"AutomaticUpdates")
++            .value_or(0)) {
++        LOG(L"AutomaticUpdates enabled: updating mods before engine start");
++        Functions::RunModUpdater(/*wait=*/true, /*noReload=*/true);
++    }
++
+     CMainWindow wnd(trayOnly, portable);
+     wnd.Create(nullptr);
+     // wnd.ShowWindow(SW_SHOW);
+diff --git a/src/windhawk/app/functions.cpp b/src/windhawk/app/functions.cpp
+index 8de915c..d801f22 100644
+--- a/src/windhawk/app/functions.cpp
++++ b/src/windhawk/app/functions.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include "functions.h"
+ 
++#include "logger.h"
++
+ namespace Functions {
+ 
+ namespace {
+@@ -615,4 +617,58 @@ void ApplyDialogLayoutRtl(CWindow wnd, bool isLayoutRtl) {
+     wnd.InvalidateRect(NULL);
+ }
+ 
++void RunModUpdater(bool wait, bool noReload) {
++    // Locate whcli.exe next to this executable; its directory is the install root
++    // (contains windhawk.ini) that whcli operates on.
++    WCHAR exePath[MAX_PATH];
++    DWORD len = GetModuleFileName(nullptr, exePath, ARRAYSIZE(exePath));
++    if (len == 0 || len >= ARRAYSIZE(exePath)) {
++        LOG(L"RunModUpdater: GetModuleFileName failed (%u)", GetLastError());
++        return;
++    }
++
++    std::wstring dir(exePath, len);
++    size_t slash = dir.find_last_of(L'\\');
++    if (slash == std::wstring::npos) {
++        LOG(L"RunModUpdater: unexpected exe path");
++        return;
++    }
++    dir.resize(slash);
++
++    std::wstring whcli = dir + L"\\whcli.exe";
++    if (GetFileAttributes(whcli.c_str()) == INVALID_FILE_ATTRIBUTES) {
++        LOG(L"RunModUpdater: whcli.exe not found at %s, skipping", whcli.c_str());
++        return;
++    }
++
++    std::wstring cmdLine = L"\"" + whcli + L"\" update --root \"" + dir + L"\"";
++    if (noReload) {
++        cmdLine += L" --no-reload";
++    }
++
++    STARTUPINFO si{};
++    si.cb = sizeof(si);
++    PROCESS_INFORMATION pi{};
++
++    // CreateProcess may write to the command-line buffer; pass a mutable copy.
++    std::wstring cmdLineMutable = cmdLine;
++    if (!CreateProcess(whcli.c_str(), cmdLineMutable.data(), nullptr, nullptr,
++                       FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi)) {
++        LOG(L"RunModUpdater: CreateProcess failed (%u)", GetLastError());
++        return;
++    }
++
++    CloseHandle(pi.hThread);
++
++    if (wait) {
++        // Bound the pre-engine wait so a slow/hung update can't block startup forever.
++        constexpr DWORD kUpdaterTimeout = 1000 * 60 * 5;  // 5 min
++        if (WaitForSingleObject(pi.hProcess, kUpdaterTimeout) == WAIT_TIMEOUT) {
++            LOG(L"RunModUpdater: updater timed out, continuing startup");
++        }
++    }
++
++    CloseHandle(pi.hProcess);
++}
++
+ }  // namespace Functions
+diff --git a/src/windhawk/app/functions.h b/src/windhawk/app/functions.h
+index f0f9ffb..a28188f 100644
+--- a/src/windhawk/app/functions.h
++++ b/src/windhawk/app/functions.h
+@@ -36,4 +36,10 @@ NTSTATUS CreateExecutionRequiredRequest(_In_ HANDLE ProcessHandle,
+ bool IsRightToLeftLanguage(LANGID langId);
+ void ApplyDialogLayoutRtl(CWindow wnd, bool isLayoutRtl);
+ 
++// Runs the bundled mod updater (whcli.exe update) for the current install.
++// noReload skips the disable/enable reload dance (use before the engine starts,
++// when there's nothing loaded to reload). If wait is true, blocks until the
++// updater exits or a timeout elapses.
++void RunModUpdater(bool wait, bool noReload);
++
+ }  // namespace Functions
+diff --git a/src/windhawk/app/main_window.cpp b/src/windhawk/app/main_window.cpp
+index 8aa2a60..3928f9c 100644
+--- a/src/windhawk/app/main_window.cpp
++++ b/src/windhawk/app/main_window.cpp
+@@ -1,5 +1,7 @@
+ #include "stdafx.h"
+ 
++#include <random>
++
+ #include "main_window.h"
+ 
+ #include "functions.h"
+@@ -15,6 +17,16 @@ constexpr auto kUpdateInitialDelay = 1000 * 10;        // 10sec
+ constexpr auto kUpdateInterval = 1000 * 60 * 60 * 24;  // 24h
+ constexpr auto kUpdateRetryTime = 1000 * 60 * 60;      // 1h
+ constexpr auto kModTasksDlgInitialDelay = 1000;        // 1sec
++constexpr UINT kAutomaticUpdateMinDelay = 1000u * 60 * 60 * 23;  // 23h
++constexpr UINT kAutomaticUpdateMaxDelay = 1000u * 60 * 60 * 24;  // 24h
++
++// Random interval in [23h, 24h] for the periodic AutomaticUpdates check.
++UINT GetRandomAutomaticUpdateDelay() {
++    static std::mt19937 rng(std::random_device{}());
++    std::uniform_int_distribution<UINT> dist(kAutomaticUpdateMinDelay,
++                                             kAutomaticUpdateMaxDelay);
++    return dist(rng);
++}
+ 
+ ULONGLONG GetTaskbarProcessCreationTime() {
+     HWND currentTaskbarWindow = FindWindow(L"Shell_TrayWnd", nullptr);
+@@ -296,6 +308,16 @@ void CMainWindow::OnTimer(UINT_PTR nIDEvent) {
+             SetTimer(Timer::kHandleNewProcesses, kHandleNewProcessInterval);
+             break;
+ 
++        case Timer::kAutomaticUpdate:
++            KillTimer(Timer::kAutomaticUpdate);
++            LOG(L"AutomaticUpdates: periodic mod update");
++            // Run in the background: the engine (this same process, portable) reacts
++            // to config changes and whcli does the disable/enable reload dance per
++            // upgraded mod.
++            Functions::RunModUpdater(/*wait=*/false, /*noReload=*/false);
++            SetTimer(Timer::kAutomaticUpdate, GetRandomAutomaticUpdateDelay());
++            break;
++
+         case Timer::kUpdateCheck:
+             KillTimer(Timer::kUpdateCheck);
+ 
+@@ -539,6 +561,11 @@ void CMainWindow::InitForPortableVersion() {
+ 
+     SetTimer(Timer::kHandleNewProcesses, kHandleNewProcessInterval);
+ 
++    if (settings->GetInt(L"AutomaticUpdates").value_or(0)) {
++        m_automaticUpdates = true;
++        SetTimer(Timer::kAutomaticUpdate, GetRandomAutomaticUpdateDelay());
++    }
++
+     m_appSettingsChangedEvent.reset(Functions::CreateEventForMediumIntegrity(
+         L"WindhawkAppSettingsChangedEvent-daemon"));
+ 
+diff --git a/src/windhawk/app/main_window.h b/src/windhawk/app/main_window.h
+index a62cec7..288d4f1 100644
+--- a/src/windhawk/app/main_window.h
++++ b/src/windhawk/app/main_window.h
+@@ -35,6 +35,7 @@ class CMainWindow : public CWindowImpl<CMainWindow, CWindow, CNullTraits>,
+         kHandleNewProcesses = 1,
+         kUpdateCheck,
+         kModTasksDlgCreate,
++        kAutomaticUpdate,
+     };
+ 
+     enum class Hotkey {
+@@ -112,6 +113,7 @@ class CMainWindow : public CWindowImpl<CMainWindow, CWindow, CNullTraits>,
+     bool m_checkForUpdates = false;  // portable version only
+     bool m_dontAutoShowToolkit = true;
+     bool m_disableToolkitHotkey = false;
++    bool m_automaticUpdates = false;
+     int m_modTasksDlgDelay = CTaskManagerDlg::kAutonomousModeShowDelayDefault;
+ 
+     // Shown automatically when mods are doing tasks such as initializing or
