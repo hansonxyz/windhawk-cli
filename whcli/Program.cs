@@ -44,6 +44,7 @@ static int Run(string[] args)
         "enable" => CmdEnableDisable(rest, true),
         "disable" => CmdEnableDisable(rest, false),
         "set-setting" => CmdSetSetting(rest),
+        "status" or "doctor" => CmdStatus(rest),
         "catalog" or "search" => CmdCatalog(rest),
         _ => Unknown(cmd),
     };
@@ -380,6 +381,44 @@ static int CmdSetSetting(string[] a)
     return 0;
 }
 
+// ---------------------------------------------------------------- status (connectivity gate)
+static int CmdStatus(string[] a)
+{
+    WindhawkInstall install;
+    try { install = ResolveTarget(Opt(a, "--root")); }
+    catch (Exception e) { Console.Error.WriteLine("[ ] install: " + e.Message); Console.WriteLine("NOT READY"); return 1; }
+
+    Console.WriteLine($"Install: {install.RootPath}");
+    Console.WriteLine($"Mode:    {(install.Portable ? "portable (INI)" : "service (registry " + install.RegSubKey + ")")}");
+
+    bool ok = true;
+    void Check(bool pass, string label) { Console.WriteLine($"[{(pass ? "x" : " ")}] {label}"); ok &= pass; }
+
+    // Compiler present (required to install/compile mods).
+    var clang = Path.Combine(install.CompilerPath, "bin", "clang++.exe");
+    Check(File.Exists(clang), $"compiler: {clang}");
+
+    // Engine import lib present for at least the 64-bit target.
+    Check(File.Exists(Path.Combine(install.EnginePath, "64", "windhawk.lib")), $"engine libs: {install.EnginePath}");
+
+    // Storage writable.
+    bool storageOk;
+    try { Directory.CreateDirectory(install.EngineModsPath); storageOk = true; }
+    catch { storageOk = false; }
+    Check(storageOk, $"storage writable: {install.EngineModsPath}");
+
+    // Service running (non-portable only).
+    if (!install.Portable)
+    {
+        string svc = Opt(a, "--service") ?? "Windhawk";
+        string state = ServiceQuery.State(svc);
+        Check(state == "running", $"service '{svc}': {state}");
+    }
+
+    Console.WriteLine(ok ? "READY" : "NOT READY");
+    return ok ? 0 : 1;
+}
+
 // ---------------------------------------------------------------- catalog / search
 static int CmdCatalog(string[] a)
 {
@@ -493,6 +532,7 @@ static void PrintHelp()
           enable <id>
           disable <id>
           set-setting <id> <name> <value>
+          status [--service <name>]          Readiness check (exit 0 when ready)
 
         Browse the remote catalog (https://mods.windhawk.net/catalog.json):
           catalog [query] [--full] [--ids]    List all mods with names/descriptions
