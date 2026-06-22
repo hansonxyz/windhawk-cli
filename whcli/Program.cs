@@ -43,6 +43,7 @@ static int Run(string[] args)
         "uninstall" or "remove" => CmdUninstall(rest),
         "enable" => CmdEnableDisable(rest, true),
         "disable" => CmdEnableDisable(rest, false),
+        "tray" => CmdTray(rest),
         "set-setting" => CmdSetSetting(rest),
         "status" or "doctor" => CmdStatus(rest),
         "catalog" or "search" => CmdCatalog(rest),
@@ -381,6 +382,39 @@ static int CmdSetSetting(string[] a)
     return 0;
 }
 
+// ---------------------------------------------------------------- tray (runtime show/hide)
+static int CmdTray(string[] a)
+{
+    var pos = Positionals(a);
+    if (pos.Count < 1 || (pos[0] != "show" && pos[0] != "hide"))
+        throw new InvalidOperationException("usage: whcli tray <show|hide> [--root <dir>]");
+    bool show = pos[0] == "show";
+    var install = ResolveTarget(Opt(a, "--root"));
+
+    // HideTrayIcon: 1 = hidden, 0 = shown. Persisted (also affects next startup).
+    AppConfig.WriteSection(install, "Settings",
+        new Dictionary<string, SettingValue> { ["HideTrayIcon"] = SettingValue.Of(show ? 0 : 1) });
+
+    // Notify the running app to re-read settings so the change applies live.
+    var exe = Path.Combine(install.RootPath, "windhawk.exe");
+    if (File.Exists(exe))
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false, CreateNoWindow = true };
+            psi.ArgumentList.Add("-app-settings-changed");
+            System.Diagnostics.Process.Start(psi);
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"  (couldn't notify the running app: {e.Message}; change applies on next start)");
+        }
+    }
+
+    Console.WriteLine($"Tray icon {(show ? "shown" : "hidden")} (HideTrayIcon={(show ? 0 : 1)}).");
+    return 0;
+}
+
 // ---------------------------------------------------------------- status (connectivity gate)
 static int CmdStatus(string[] a)
 {
@@ -531,6 +565,7 @@ static void PrintHelp()
           uninstall <id>
           enable <id>
           disable <id>
+          tray <show|hide>                   Show/hide the system tray icon at runtime
           set-setting <id> <name> <value>
           status [--service <name>]          Readiness check (exit 0 when ready)
 

@@ -79,7 +79,9 @@ whcli update --root "C:\Program Files\WindhawkXYZ"      # upgrade outdated mods
 whcli status --root "C:\Program Files\WindhawkXYZ" --service WindhawkXYZ
 ```
 
-Other commands: `uninstall`, `enable`, `search` (alias of `catalog`), `export`, `apply`.
+Other commands: `uninstall`, `enable`, `search` (alias of `catalog`), `export`, `apply`,
+`tray <show|hide>` (show/hide the system-tray icon at runtime, independent of the startup
+default).
 
 ## Scripting & unattended provisioning
 
