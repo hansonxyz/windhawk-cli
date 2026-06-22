@@ -16,8 +16,14 @@
 [Oo]bj/
 *.user
 
-# Built whcli.exe is a derived artifact (rebuild via whcli\build.ps1)
+# Built whcli.exe / whsetup.exe / installer package are derived artifacts
 /dist/
+
+# Code-signing PRIVATE keys — never commit. (The public certs/*.cer IS committed,
+# it's what the fleet trusts; the private key stays in the signing machine's store.)
+*.pfx
+*.snk
+*.key
 
 # NOTE: profile.json (the canonical deployment profile) and mods/ (pinned mod
 # sources) ARE committed on purpose -- they are the reproducible provisioning input.
