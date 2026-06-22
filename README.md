@@ -173,13 +173,12 @@ $whcli = "$root\whcli.exe"
 # 2. Install a couple of mods (one call → one service start; both go live at once).
 & $whcli install disable-feedback-hub-hotkey f1-blocker --root $root
 
-# 3. Configure a mod's settings via the CLI, then change one later.
-& $whcli set-setting passkey-popup-blocker timeout 800 --root $root
-& $whcli install passkey-popup-blocker --root $root          # install it first
-& $whcli set-setting passkey-popup-blocker block_result user_cancelled --root $root
+# 3. Install another mod, then configure its settings via the CLI.
+& $whcli install hide-dotfiles-explorer --root $root
+& $whcli set-setting hide-dotfiles-explorer displayMode neverShow --root $root
 
 # 4. Inspect a mod: config, compiled DLLs, and which processes it's injected into.
-& $whcli mod-status passkey-popup-blocker --root $root
+& $whcli mod-status hide-dotfiles-explorer --root $root
 
 # 5. Service control (the engine live-applies config, so this is only for explicit control).
 & $whcli restart --root $root      # e.g. after a big batch of changes

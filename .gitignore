@@ -46,3 +46,6 @@ desktop.ini
 
 # Generated embedded payload for the single-file installer
 /whsetup/payload.zip
+
+# Local-only export of personal preferences + fleet-provisioning instructions
+/local_prferences_export/
