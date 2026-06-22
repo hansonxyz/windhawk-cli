@@ -6,7 +6,7 @@ using System.Security.Principal;
 using Microsoft.Win32;
 using Whsetup;
 
-const string Version = "1.0.1";
+const string Version = "1.0.0";
 const string ServiceName = "WindhawkCLI";
 const string DisplayName = "Windhawk CLI";
 const string RegSubKey = @"SOFTWARE\WindhawkCLI";

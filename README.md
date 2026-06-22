@@ -168,7 +168,7 @@ $whcli = "$root\whcli.exe"
 
 # 1. Install silently: service install, auto-updates on, Defender exclusion added.
 #    Use --update to replace an existing install (plain install refuses if one is present).
-.\windhawk-cli-1.0.1-installer.exe --silent --auto-updates --add-defender-exclusion
+.\windhawk-cli-1.0.0-installer.exe --silent --auto-updates --add-defender-exclusion
 
 # 2. Install a couple of mods (one call → one service start; both go live at once).
 & $whcli install disable-feedback-hub-hotkey f1-blocker --root $root
