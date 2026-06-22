@@ -112,6 +112,16 @@ Install a **precompiled mod from a local folder** (no network) — the folder ho
 whcli install-local C:\mods\taskbar-grouping
 ```
 
+**Offline mod cache** — export every installed mod (sources + precompiled DLLs + settings) to a
+self-contained directory, then reinstall the whole set on another machine with **no network**:
+
+```
+whcli export-cache  C:\windhawk-cache     # target must NOT already exist
+whcli install-cache C:\windhawk-cache     # installs every mod + its settings from the cache
+```
+
+See [Offline mod cache](#offline-mod-cache) below for the full story.
+
 Service control (needs elevation):
 
 ```
@@ -188,6 +198,42 @@ If the service is running, every install/enable/disable/set-setting takes effect
 (the engine watches its config and reloads). If you stopped it, changes are persisted and
 load the next time it starts. To update later without waiting for auto-update:
 `whcli update` (all mods) or `whcli update <id>`; `whcli self-update` for the app itself.
+
+## Offline mod cache
+
+For provisioning that must not depend on the Windhawk servers being reachable at install time,
+windhawk-cli can ship a **self-contained offline cache** of mods and reinstall from it with no
+network. This is ideal for fleet images: bake the cache once, provision anywhere, and let
+auto-update bring everything current later when connectivity is available.
+
+```
+whcli export-cache C:\windhawk-cache          # target dir must NOT exist (errors if it does)
+whcli install-cache C:\windhawk-cache         # reinstall every mod + settings from the cache
+```
+
+`export-cache` writes one subfolder per mod (named by mod id), each containing:
+
+```
+C:\windhawk-cache\
+  taskbar-grouping\
+    taskbar-grouping.wh.cpp     # the mod source (metadata)
+    1.3.10_64.dll               # precompiled DLL(s), one per architecture (<version>_<sub>.dll)
+    config.json                 # { "version", "disabled", "settings": { ... } }
+  hide-dotfiles-explorer\
+    ...
+```
+
+`install-cache` installs every mod from such a directory **offline** — copying the DLLs and
+applying each mod's `config.json` (enabled/disabled state + settings). It continues past any
+failed mod and prints a succeeded/failed summary (non-zero exit if any failed). The `config.json`
+per mod is optional; without it a mod installs with its declared defaults. The format round-trips:
+`export-cache` on one machine → copy the folder → `install-cache` on another reproduces the exact
+set, byte-for-byte settings included.
+
+**Auto-update after import:** if the target has `AutomaticUpdates` enabled, `install-cache`
+immediately runs a mod update after importing — so a machine provisioned from a possibly-stale
+offline cache catches up to the latest published versions as soon as it's online (and the cached
+versions remain in place if it's still offline).
 
 ## Windows Defender
 

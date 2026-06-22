@@ -33,6 +33,9 @@ static int Run(string[] args)
     string cmd = args[0];
     string[] rest = args[1..];
 
+    // `whcli <command> --help` (or -h) prints detailed help for that one command.
+    if (rest.Contains("-h") || rest.Contains("--help")) return PrintCommandHelp(cmd);
+
     // Serialize mutating operations machine-wide so concurrent automations don't
     // interleave registry/file writes or race the engine's live reload. Read-only
     // commands (list/status/catalog/mod-status/export) run without the lock.
@@ -57,7 +60,7 @@ static int Run(string[] args)
 // Only commands that write mod config/files take the lock. start/stop/restart are service
 // control (no config mutation) and must NOT hold it — the service's own pre-engine-start
 // updater needs the lock, so a start that held it would deadlock its own startup.
-static bool IsMutating(string c) => c is "apply" or "install" or "install-local" or "update"
+static bool IsMutating(string c) => c is "apply" or "install" or "install-local" or "install-cache" or "update"
     or "self-update" or "auto-update" or "uninstall" or "remove" or "enable" or "disable"
     or "set-setting" or "tray";
 
@@ -68,6 +71,8 @@ static int Dispatch(string cmd, string[] rest) => cmd switch
     "list" => CmdList(rest),
     "install" => CmdInstall(rest),
     "install-local" => CmdInstallLocal(rest),
+    "install-cache" => CmdInstallCache(rest),
+    "export-cache" => CmdExportCache(rest),
     "update" => CmdUpdate(rest),
     "self-update" => CmdSelfUpdate(rest),
     "auto-update" => CmdAutoUpdate(rest),
@@ -198,23 +203,42 @@ static int CmdInstall(string[] a)
     bool disabled = Flag(a, "--disabled");
     bool arm64 = Arm64Enabled(a);
 
-    // Install all requested mods (configs written once each; the engine live-reloads),
-    // then start the service once. Aggregate result: non-zero if any failed (for retries).
-    int failed = 0;
+    // Install every requested mod. A failure on one does NOT stop the rest (configs are
+    // written per mod and the engine live-reloads); the service is started once at the end.
+    var succeeded = new List<string>();
+    var failures = new List<(string id, string error)>();
     foreach (var id in pos)
     {
         try
         {
             // No explicit settings -> the mod uses the defaults declared in its source.
             InstallMod(install, store, id, version ?? "", disabled, settings: null, arm64);
-            Console.WriteLine($"Installed {id}.");
+            Console.WriteLine($"  ok    {id}");
+            succeeded.Add(id);
         }
-        catch (Exception e) { Console.Error.WriteLine($"  install {id} failed: {e.Message}"); failed++; }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"  FAIL  {id}: {e.Message}");
+            failures.Add((id, e.Message));
+        }
     }
 
-    if (failed < pos.Count) EnsureServiceRunning(install, a);
-    if (failed > 0) { Console.Error.WriteLine($"{failed} of {pos.Count} install(s) failed."); return 1; }
-    return 0;
+    if (succeeded.Count > 0) EnsureServiceRunning(install, a);
+
+    // Status summary: list every successful and failed mod.
+    Console.WriteLine();
+    Console.WriteLine($"Install summary: {succeeded.Count} succeeded, {failures.Count} failed (of {pos.Count}).");
+    if (succeeded.Count > 0)
+        Console.WriteLine("  succeeded: " + string.Join(", ", succeeded));
+    if (failures.Count > 0)
+    {
+        Console.WriteLine("  failed:");
+        foreach (var f in failures)
+            Console.WriteLine($"    {f.id}: {f.error}");
+    }
+
+    // Non-zero if any failed, so automation can retry.
+    return failures.Count > 0 ? 1 : 0;
 }
 
 // ---------------------------------------------------------------- install-local
@@ -268,6 +292,142 @@ static int CmdInstallLocal(string[] a)
 
     Console.WriteLine($"Installed {meta.Id} v{meta.Version} from local source ({srcDir}).");
     EnsureServiceRunning(install, a);
+    return 0;
+}
+
+// ---------------------------------------------------------------- install-cache (offline bundle)
+static int CmdInstallCache(string[] a)
+{
+    var pos = Positionals(a);
+    if (pos.Count < 1)
+        throw new InvalidOperationException("usage: whcli install-cache <cache-dir> [--root <dir>] [--arm64]");
+    string cacheDir = pos[0];
+    if (!Directory.Exists(cacheDir)) throw new InvalidOperationException($"cache dir not found: {cacheDir}");
+
+    var install = ResolveTarget(Opt(a, "--root"));
+    var store = install.OpenStore();
+    bool arm64 = Arm64Enabled(a);
+
+    var modDirs = Directory.GetDirectories(cacheDir).OrderBy(x => x, StringComparer.Ordinal).ToList();
+    if (modDirs.Count == 0) throw new InvalidOperationException($"no mod subdirectories found in cache: {cacheDir}");
+
+    // Install every cached mod; a failure on one does not stop the rest.
+    var succeeded = new List<string>();
+    var failures = new List<(string id, string error)>();
+    foreach (var md in modDirs)
+    {
+        string id0 = Path.GetFileName(md);
+        try
+        {
+            var cpps = Directory.GetFiles(md, "*.wh.cpp");
+            if (cpps.Length == 0) throw new InvalidOperationException("cache entry has no .wh.cpp source");
+            string source = File.ReadAllText(cpps[0]);
+            var meta = ModMetadata.Parse(source);
+            if (string.IsNullOrEmpty(meta.Id)) throw new InvalidOperationException("source is missing an @id header");
+
+            // Optional per-mod default configuration.
+            bool disabled = false;
+            Dictionary<string, SettingValue>? settings = null;
+            string cfgPath = Path.Combine(md, ModCache.ConfigFileName);
+            if (File.Exists(cfgPath)) (disabled, settings) = ModCache.ReadConfig(cfgPath);
+
+            string dll = PrecompiledMods.CopyLocal(install.EngineModsPath, md, meta.Id, meta.Version, meta.Architecture, arm64);
+            store.SetModConfig(meta.Id, new ModConfig
+            {
+                LibraryFileName = dll,
+                Disabled = disabled,
+                Include = meta.Include,
+                Exclude = meta.Exclude,
+                Architecture = meta.Architecture,
+                Version = meta.Version,
+            });
+            if (settings is not null) store.SetModSettings(meta.Id, settings);
+
+            Directory.CreateDirectory(install.ModsSourcePath);
+            File.WriteAllText(Path.Combine(install.ModsSourcePath, meta.Id + ".wh.cpp"), source);
+            ModFiles.DeleteOld(install.EngineModsPath, meta.Id, ModFiles.SubfoldersFor(meta.Architecture, arm64), dll);
+
+            Console.WriteLine($"  ok    {meta.Id} v{meta.Version}" + (disabled ? " (disabled)" : "") +
+                              (settings is { Count: > 0 } ? $" ({settings.Count} settings)" : ""));
+            succeeded.Add(meta.Id);
+        }
+        catch (Exception e) { Console.Error.WriteLine($"  FAIL  {id0}: {e.Message}"); failures.Add((id0, e.Message)); }
+    }
+
+    if (succeeded.Count > 0) EnsureServiceRunning(install, a);
+
+    Console.WriteLine();
+    Console.WriteLine($"Cache install summary: {succeeded.Count} succeeded, {failures.Count} failed (of {modDirs.Count}).");
+    if (succeeded.Count > 0) Console.WriteLine("  succeeded: " + string.Join(", ", succeeded));
+    if (failures.Count > 0)
+    {
+        Console.WriteLine("  failed:");
+        foreach (var f in failures) Console.WriteLine($"    {f.id}: {f.error}");
+    }
+
+    // If AutomaticUpdates is on, pull latest mod versions now (best-effort; offline cache
+    // gets the user online quickly, then this brings everything current). Offline = no-op.
+    var appSettings = AppConfig.ReadSection(install, "Settings");
+    bool autoUp = appSettings.TryGetValue("AutomaticUpdates", out var au) && au.IsInt && au.Int != 0;
+    if (autoUp && succeeded.Count > 0)
+    {
+        Console.WriteLine("\nAutomaticUpdates is on — updating installed mods to latest...");
+        try { CmdUpdate(new[] { "--root", install.RootPath }); }
+        catch (Exception e) { Console.Error.WriteLine($"  (mod update skipped: {e.Message})"); }
+    }
+
+    return failures.Count > 0 ? 1 : 0;
+}
+
+// ---------------------------------------------------------------- export-cache (offline bundle)
+static int CmdExportCache(string[] a)
+{
+    var pos = Positionals(a);
+    if (pos.Count < 1)
+        throw new InvalidOperationException("usage: whcli export-cache <target-dir> (must not exist) [--root <dir>]");
+    string target = pos[0];
+    if (Directory.Exists(target) || File.Exists(target))
+        throw new InvalidOperationException($"target '{target}' already exists; choose a path that does not exist.");
+
+    var install = ResolveTarget(Opt(a, "--root"));
+    var store = install.OpenStore();
+    var ids = store.GetInstalledModIds().OrderBy(x => x, StringComparer.Ordinal).ToList();
+    if (ids.Count == 0) throw new InvalidOperationException("no installed mods to export.");
+
+    Directory.CreateDirectory(target);
+    int ok = 0;
+    var warnings = new List<string>();
+    foreach (var id in ids)
+    {
+        var cfg = store.GetModConfig(id);
+        if (cfg is null) continue;
+        string modDir = Path.Combine(target, id);
+        Directory.CreateDirectory(modDir);
+
+        // Source (.wh.cpp) — required to reimport the mod's metadata.
+        string src = Path.Combine(install.ModsSourcePath, id + ".wh.cpp");
+        if (File.Exists(src)) File.Copy(src, Path.Combine(modDir, id + ".wh.cpp"), true);
+        else warnings.Add($"{id}: source .wh.cpp not found — this cache entry won't be importable");
+
+        // Compiled DLLs -> <version>_<sub>.dll (the convention install-cache/install-local read).
+        int dllCount = 0;
+        foreach (var sub in ModFiles.AllSubfolders(true))
+        {
+            string dllSrc = Path.Combine(install.EngineModsPath, sub, cfg.LibraryFileName);
+            if (File.Exists(dllSrc)) { File.Copy(dllSrc, Path.Combine(modDir, $"{cfg.Version}_{sub}.dll"), true); dllCount++; }
+        }
+        if (dllCount == 0) warnings.Add($"{id}: no compiled DLLs found to export");
+
+        // config.json — enabled/disabled + user settings.
+        var settings = store.GetModSettings(id);
+        ModCache.WriteConfig(Path.Combine(modDir, ModCache.ConfigFileName), cfg.Version, cfg.Disabled, settings);
+
+        Console.WriteLine($"  exported {id} v{cfg.Version} ({(cfg.Disabled ? "disabled" : "enabled")}, {dllCount} dll, {settings.Count} settings)");
+        ok++;
+    }
+    foreach (var w in warnings) Console.Error.WriteLine($"  warning: {w}");
+    Console.WriteLine($"Exported {ok} mod(s) to {target}");
+    Console.WriteLine($"Reinstall this cache on another machine with:  whcli install-cache \"{target}\"");
     return 0;
 }
 
@@ -822,24 +982,25 @@ static void PrintHelp()
         whcli {Version} — Windhawk CLI / migration tool
 
         Usage: whcli <command> [options]
+               whcli <command> --help      Detailed help for one command
+               whcli                       (no args) shows this help
 
         Profiles (migration / provisioning):
-          export [--from <root>] [--out profile.json] [--bundle <dir>] [--no-bundle]
-                                  Snapshot installed mods+settings to a profile and bundle sources.
-          apply <profile.json> [--root <dir>] [--bundle <dir>] [--no-fetch] [--app-settings] [--arm64]
-                                  Install+compile+configure every mod in a profile into a target.
+          export [--from <root>] [--out profile.json]   Snapshot installed mods+settings to a profile
+          apply <profile.json> [--app-settings] [--arm64]  Install+configure every mod from a profile (precompiled)
+
+        Offline mod cache (self-contained bundle; no network needed to install):
+          export-cache <dir>                 Export installed mods + DLLs + settings to a NEW dir (must not exist)
+          install-cache <dir>                Install every mod from such a cache; if auto-updates are on,
+                                             update mods to latest right afterward
 
         Single mods (target = --root <dir> or $WHCLI_ROOT):
           list
           install <id> [<id>...] [--version v] [--disabled] [--arm64]
-                                  Install one or more PRECOMPILED mods from the catalog,
-                                  then start the service (mods go live immediately).
+                                             Install one or more PRECOMPILED mods from the catalog
           install-local <dir|.wh.cpp> [--disabled] [--arm64]
-                                  Install a PRECOMPILED mod from a local folder (no network):
-                                  the dir holds <id>.wh.cpp plus DLLs named <version>_<sub>.dll
-                                  (e.g. 1.3.10_64.dll) or <sub>.dll (e.g. 64.dll).
-          update [<id>...] [--dry-run] [--no-reload]
-                                  Upgrade mods to catalog latest (no ids = all installed)
+                                             Install a precompiled mod from a local folder
+          update [<id>...] [--dry-run]       Upgrade mods to catalog latest (no ids = all installed)
           self-update [--dry-run]            Update the app itself (signed) from the release feed
           auto-update                        self-update if available, otherwise update mods
           uninstall <id>
@@ -850,20 +1011,180 @@ static void PrintHelp()
           set-setting <id> <name> <value>
           status [--service <name>]          Readiness check (exit 0 when ready)
 
-        Service control (non-portable installs; need elevation):
-          start [--service <name>]           Start the engine service
-          stop  [--service <name>]           Stop the engine service
-          restart [--service <name>]         Restart (valid even from a stopped state)
+        Service control (need elevation):
+          start | stop | restart [--service <name>]   Control the engine service (restart valid from stopped)
 
         Browse the remote catalog (https://mods.windhawk.net/catalog.json):
-          catalog [query] [--full] [--ids]    List all mods with names/descriptions
-          search  [query]                     Alias for catalog (filter by query)
+          catalog [query] [--full] [--ids]   List catalog mods; 'search' is an alias
 
-        Notes:
-          * A "target" is a Windhawk root dir containing windhawk.ini (portable build).
-          * Sources resolve from --bundle (or $WHCLI_BUNDLE, default ./mods); fetch from
-            windhawk-mods is a fallback unless --no-fetch.
+        Run 'whcli <command> --help' for detailed usage of any command.
+        Project: https://github.com/hansonxyz/windhawk-cli
         """);
+}
+
+// Detailed per-command help (whcli <command> --help). Returns an exit code.
+static int PrintCommandHelp(string cmd)
+{
+    string? help = cmd switch
+    {
+        "install" => """
+            whcli install <mod-id> [<mod-id>...] [options]
+
+            Install one or more mods PRECOMPILED from the catalog (https://mods.windhawk.net).
+            Each mod's config is written and the running engine live-reloads it; the service is
+            started once at the end. Installation CONTINUES past a failed mod and prints a
+            summary listing every succeeded and failed mod; the exit code is non-zero if any
+            failed (so automation can retry).
+
+            Options:
+              --version <v>    Pin a version (single mod only; default = latest).
+              --disabled       Install but leave the mod disabled.
+              --arm64          Also fetch the ARM64 build.
+              --root <dir>     Target install (or $WHCLI_ROOT; default = the WindhawkCLI service).
+            """,
+        "install-local" => """
+            whcli install-local <dir|.wh.cpp> [options]
+
+            Install a single PRECOMPILED mod from local files (no network). Point at either a
+            folder containing one <id>.wh.cpp, or the .wh.cpp file directly. The precompiled
+            DLLs must sit beside it, named "<version>_<sub>.dll" (e.g. 1.3.10_64.dll) or
+            "<sub>.dll" (e.g. 64.dll), where <sub> is 32 / 64 / arm64.
+
+            Options:
+              --disabled       Install but leave the mod disabled.
+              --arm64          Also install the ARM64 build if present.
+              --root <dir>     Target install.
+            """,
+        "install-cache" => """
+            whcli install-cache <cache-dir> [options]
+
+            Install EVERY mod from an offline cache directory (produced by 'export-cache'). The
+            cache has one subfolder per mod (named by mod id), each containing:
+              - <id>.wh.cpp            the mod source (for metadata)
+              - <version>_<sub>.dll    precompiled DLLs (e.g. 1.3.10_64.dll), one per arch
+              - config.json            (optional) { "version", "disabled", "settings": {...} }
+
+            Installs continue past failures and print a succeeded/failed summary (non-zero exit
+            if any failed). No network is needed. If AutomaticUpdates is enabled on the target,
+            mods are updated to catalog latest immediately afterward (best-effort; offline = skip).
+
+            Options:
+              --arm64          Also install ARM64 builds present in the cache.
+              --root <dir>     Target install.
+            """,
+        "export-cache" => """
+            whcli export-cache <target-dir> [options]
+
+            Export all installed mods to a self-contained offline cache that 'install-cache' can
+            reinstall. <target-dir> MUST NOT already exist (errors if it does). Produces one
+            subfolder per mod with its source (.wh.cpp), its compiled DLLs (as <version>_<sub>.dll),
+            and a config.json capturing enabled/disabled + the mod's settings. Use this to seed an
+            offline provisioning cache so first install doesn't depend on the Windhawk servers.
+
+            Options:
+              --root <dir>     Source install to export from.
+            """,
+        "update" => """
+            whcli update [<mod-id>...] [options]
+
+            Upgrade mods to the catalog's latest version. With no ids, every installed mod is
+            checked; otherwise only the named ids. Settings are preserved across the upgrade.
+
+            Options:
+              --dry-run        Show what would update, change nothing.
+              --no-reload      Skip the live disable/swap/enable dance (used before the engine starts).
+              --root <dir>     Target install.
+            """,
+        "self-update" => """
+            whcli self-update [--dry-run]
+
+            Check the GitHub release feed (hansonxyz/windhawk-cli) for a newer windhawk-cli, and
+            if found, download the signed installer, verify its Authenticode signature against the
+            pinned certificate, and launch it to replace this install. Defers if the signature is
+            invalid. --dry-run only reports availability.
+            """,
+        "auto-update" => """
+            whcli auto-update [--root <dir>]
+
+            Self-update the app if a newer signed release exists; otherwise update all mods to
+            catalog latest. This is what the service runs on a schedule when AutomaticUpdates is on.
+            """,
+        "apply" => """
+            whcli apply <profile.json> [options]
+
+            Install + configure every mod listed in a profile.json (from 'export'). Mods are
+            fetched PRECOMPILED from the catalog. Continues past failures.
+
+            Options:
+              --app-settings   Also apply the app/engine settings captured in the profile.
+              --arm64          Also fetch ARM64 builds.
+              --root <dir>     Target install.
+            """,
+        "export" => """
+            whcli export [options]
+
+            Snapshot an install's mods + settings to a profile.json (and bundle the mod sources).
+            For a full offline bundle incl. compiled DLLs, use 'export-cache' instead.
+
+            Options:
+              --from <root>    Export from this install (default: auto-detect installed).
+              --out <file>     Output path (default: profile.json).
+              --bundle <dir>   Where to copy mod sources (default: ./mods).
+              --no-bundle      Don't copy sources.
+            """,
+        "list" => "whcli list [--root <dir>]\n\nList installed mods with their enabled/disabled state and version.",
+        "mod-status" => """
+            whcli mod-status <mod-id> [--root <dir>]
+
+            Show a mod's config (version, enabled/disabled, include/exclude, architectures), which
+            compiled DLLs are present per arch, and — most usefully — which running processes
+            currently have the mod's DLL loaded (proof it's actually injected and working).
+            """,
+        "enable" or "disable" => """
+            whcli enable|disable <mod-id> [<mod-id>...] [--root <dir>]
+
+            Enable or disable one or more installed mods. 'enable' also starts the service. The
+            running engine live-applies the change.
+            """,
+        "uninstall" or "remove" => "whcli uninstall <mod-id> [--root <dir>]\n\nRemove a mod's config and its compiled DLLs. The engine live-unloads it.",
+        "set-setting" => """
+            whcli set-setting <mod-id> <name> <value> [--root <dir>]
+
+            Set a single mod setting. Numeric values are stored as integers, everything else as
+            strings. Array-style keys (e.g. items[0]) are supported. The engine live-applies it.
+            """,
+        "start" or "stop" or "restart" => """
+            whcli start | stop | restart [--service <name>] [--root <dir>]
+
+            Control the engine Windows service (needs elevation). 'restart' is valid even from a
+            stopped state. 'stop' waits for the service process to fully exit before returning.
+            Default service name: WindhawkCLI.
+            """,
+        "status" or "doctor" => """
+            whcli status [--service <name>] [--root <dir>]
+
+            Readiness check: verifies the engine, mod runtime libs, writable storage, and (for a
+            service install) that the service is running. Exits 0 only when everything is READY —
+            use it as a gate in provisioning scripts.
+            """,
+        "catalog" or "search" => """
+            whcli catalog [query] [--full] [--ids]
+
+            Browse the official mod catalog (https://mods.windhawk.net/catalog.json). Optional
+            query filters by id/name/description/author. --ids prints only ids; --full prints
+            untruncated descriptions. 'search' is an alias.
+            """,
+        "tray" => "whcli tray <show|hide> [--root <dir>]\n\nShow or hide the system-tray icon at runtime (also persists for next startup).",
+        _ => null,
+    };
+
+    if (help is null)
+    {
+        Console.Error.WriteLine($"whcli: no detailed help for '{cmd}' (try: whcli --help)");
+        return 2;
+    }
+    Console.WriteLine(help);
+    return 0;
 }
 
 // Fork identity constants (used by self-update).
