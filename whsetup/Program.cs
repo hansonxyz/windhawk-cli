@@ -30,6 +30,23 @@ int Run(string[] a)
     if (Has(a, "-h") || Has(a, "--help")) { Help(); return 0; }
     if (Has(a, "--version")) { Console.WriteLine(Version); return 0; }
 
+    // Fail fast on unrecognized/positional args. The common cause is an unquoted path
+    // with spaces (e.g. PowerShell `Start-Process -ArgumentList` does NOT quote array
+    // elements, so `--install-dir C:\Program Files\WindhawkCLI` arrives split into
+    // `--install-dir`, `C:\Program`, and a stray `Files\WindhawkCLI`). Rejecting the
+    // stray arg turns a silent botched install (to C:\Program) into a clear error.
+    var unknown = UnknownArgs(a);
+    if (unknown.Count > 0)
+    {
+        Console.Error.WriteLine("error: unexpected argument(s): " + string.Join(", ", unknown));
+        Console.Error.WriteLine("If a path contains spaces, quote it, e.g.:");
+        Console.Error.WriteLine("  whsetup --install-dir \"C:\\Program Files\\WindhawkCLI\" ...");
+        Console.Error.WriteLine("(PowerShell tip: prefer the call operator `& .\\whsetup.exe --install-dir \"<path>\"` " +
+            "over `Start-Process -ArgumentList`, which does not quote array elements containing spaces.)");
+        Console.Error.WriteLine("Run with --help for usage.");
+        return 1;
+    }
+
     RequireAdmin();
 
     if (Has(a, "--uninstall")) return Uninstall(Opt(a, "--install-dir") ?? DefaultDir);
@@ -363,6 +380,26 @@ static string? Opt(string[] a, string name)
 {
     for (int i = 0; i < a.Length - 1; i++) if (a[i] == name) return a[i + 1];
     return null;
+}
+
+// Return any args that aren't a known flag or a known option (and its consumed value).
+// Used to reject mis-split/typo'd command lines (e.g. an unquoted path with spaces).
+static System.Collections.Generic.List<string> UnknownArgs(string[] a)
+{
+    var flags = new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+    {
+        "-h", "--help", "--version", "--uninstall", "--silent", "-S",
+        "--auto-updates", "--no-system-tray", "--add-defender-exclusion", "--update", "--force",
+    };
+    var opts = new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal) { "--install-dir" };
+    var unknown = new System.Collections.Generic.List<string>();
+    for (int i = 0; i < a.Length; i++)
+    {
+        if (flags.Contains(a[i])) continue;
+        if (opts.Contains(a[i])) { i++; continue; } // skip the option's value
+        unknown.Add(a[i]);
+    }
+    return unknown;
 }
 
 static string Ask(string prompt, string def)
